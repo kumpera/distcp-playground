@@ -4,7 +4,7 @@ import dataclasses
 from functools import partial
 import shutil
 import os
-from typing import Tuple
+from typing import Any, Dict, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -13,7 +13,7 @@ from torch.distributed._shard import shard_parameter
 from torch.distributed._shard.api import shard_module
 from torch.distributed._shard.checkpoint.planner import LoadPlan
 from torch.distributed._shard.checkpoint.default_planner import DefaultLoadPlanner
-from torch.distributed._shard.checkpoint.metadata import BytesStorageMetadata, MetadataIndex, TensorStorageMetadata
+from torch.distributed._shard.checkpoint.metadata import STATE_DICT_TYPE, BytesStorageMetadata, MetadataIndex, TensorStorageMetadata
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor.api import ShardedTensor
 from torch.distributed._shard.sharded_tensor.metadata import TensorProperties
@@ -38,6 +38,10 @@ from distcp_playground.dist_2d import (
     NestedTensorSaver,
     NestedTensorLoader,
     NestedRenamingTensorSaver
+)
+from torch.distributed._shard.checkpoint.resharding import(
+    create_read_items,
+    _create_sharded_read_items
 )
 
 from distcp_playground.run import dist_run
@@ -260,16 +264,11 @@ def element_wise_add(a, b):
 def element_wise_sub(a, b):
     return [i_a - i_b for i_a, i_b in zip(a,b)]
 
-
-from torch.distributed._shard.checkpoint.resharding import(
-    create_read_items,
-    _create_sharded_read_items
-)
-
 class ReaderWithOffset(DefaultLoadPlanner):
-    def __init__(self, offsets) -> None:
+    def __init__(self, layout_specs) -> None:
         super().__init__()
-        self.offsets = offsets
+        # str ->tuple(offset, size)
+        self.layout_specs = layout_specs
     
     def create_local_plan(self) -> LoadPlan:
         requests = []
@@ -279,14 +278,12 @@ class ReaderWithOffset(DefaultLoadPlanner):
             if not isinstance(obj, ShardedTensor):
                 requests += create_read_items(fqn, md, obj)
                 continue
-            if fqn not in self.offsets:
-                # p0(f"{fqn} has no offsets")
+            if fqn not in self.layout_specs:
                 requests += create_read_items(fqn, md, obj)
                 continue
             
-            p0(f"{fqn} has offsets, off we go! (pun intended)")
-            offset = self.offsets[fqn]
-            # requests += create_read_items(fqn, md, obj)
+            offset = self.layout_specs[fqn][0]
+
             assert len(obj.local_shards()) == 1
             original_shard = obj.local_shards()[0]
             shard_md = copy.deepcopy(original_shard.metadata)
@@ -294,105 +291,80 @@ class ReaderWithOffset(DefaultLoadPlanner):
             local_shards = [Shard(original_shard.tensor, shard_md)]
 
             reqs = _create_sharded_read_items(fqn, md, local_shards)
+            # The WriteItems will have a displaced MetadataIndex, fix it.
+            # BTW, we should change _create_sharded_read_items to have more ergnomic API
             for wi in reqs:
                 original_offset = element_wise_sub(wi.dest_index.offset, offset)
-                
                 original_index = dataclasses.replace(wi.dest_index, offset=torch.Size(original_offset))
                 self.translation[wi.dest_index] = original_index
-                if fqn.endswith("exp_avg"):
-                    print(f"[{dist.get_rank()}] >> {wi} / ({original_index})")
-                
+
             requests += reqs
         return LoadPlan(requests)
 
     def lookup_tensor(self, index: MetadataIndex) -> torch.Tensor:
         return super().lookup_tensor(self.translation.get(index, index))
 
-def load_2d_optimizer_state_dict(fsdp_pg, model_state_dict):
-    prefix = [ "state", "param_groups" ]
-    metadata = dist_cp.FileSystemReader("checkpoint").read_metadata()
-    global_spec = ChunkShardingSpec(
-        dim=0,
-        placements=[f"rank:{i}/cuda:{i}" for i in range(dist.get_world_size())]
-    )
-    tp_spec = create_colwise_spec(fsdp_pg)
+def is_nested_sharded_tensor(val: Any) -> bool:
+    return isinstance(val, ShardedTensor) and isinstance(val.local_shards()[0].tensor, ShardedTensor)
 
-    state_dict = {}
-    # if dist.get_rank() == 0:
-    #     traverse_state_dict(model_state_dict, print_sharded_tensor)
-    #     print(metadata)
-    specs = {}
-
+def get_state_dict_2d_layout(state_dict: STATE_DICT_TYPE) -> Dict[str, Tuple[Sequence[int], Sequence[int]]]:
     """
     We have to load the right TP slice of the optimizer state.
-    This is not easy since the per-tensor slicing is not public and deterministic.
-        We take advantage of the state dict producing a sliced ST to figure out what we need to load.
+    This is not easy since the per-tensor slicing can't be inferred from checkpoint metadata.
+    We take advantage of the model state_dict producing a sliced ST to figure out what we need to load.
+    This is pretty fragile and it might be easier for FSDP to compute this info for us.
 
-    This is pretty fragile and it might be easier for FSDP tod it as it has all this info
+    Returns a dictionary where keys are the same of the state_dict and the value is a tuple of
+    (offset, size) for the current rank TP slice.
+
+    N.B. The state_dict *MUST* come from FSDP.sharded_state_dict.
     """
-    for key,value in model_state_dict.items():
-        if isinstance(value, ShardedTensor):
-            if isinstance(value.local_shards()[0].tensor, ShardedTensor):
-                shard = value.local_shards()[0]
-                specs[key] = (shard.metadata.shard_offsets, shard.metadata.shard_sizes, tp_spec, fsdp_pg)
+    specs = {}
+    for key, value in state_dict.items():
+        specs[key] = (None, value.size())
+        if is_nested_sharded_tensor(value):
+            shard = value.local_shards()[0]
+            specs[key] = (shard.metadata.shard_offsets, shard.metadata.shard_sizes)
+    return specs
 
-            else:
-                specs[key] = (None, value.size(), global_spec, None)
-        elif isinstance(value, torch.Tensor):
-            specs[key] = (None, value.size(), global_spec, None)
+def load_2d_optimizer_state_dict(fsdp_pg, model_state_dict):
+    #FIXME this needs to be made general
+    prefix = [ "state", "param_groups" ]
+    metadata = dist_cp.FileSystemReader("checkpoint").read_metadata()
 
+    tp_spec = create_colwise_spec(fsdp_pg)
+    state_dict = {}
+    layout_specs = get_state_dict_2d_layout(model_state_dict)
 
-    offset_info = {}
     for key, value in metadata.state_dict_metadata.items():
         if not key_stars_with(key, prefix):
             continue
         if isinstance(value, BytesStorageMetadata):
             state_dict[key] = "<bytes_io>"
+            continue
+        value: TensorStorageMetadata
+        if value.size.numel() == 1:
+            state_dict[key] = alloc_tensor(value.properties, value.size)
         else:
-            # this is a hack to extract the model FQN from the optimizer state key. IE for state.foo.bar.exp_avg we want foo.bar
+            # FIXME this is a hack to extract the model FQN from the optimizer state key. IE for state.foo.bar.exp_avg we want foo.bar
             spec_key = key[6:key.rindex('.')]
-            alloc_spec = specs.get(spec_key, (None, value.size, global_spec, None))
-            p0(f"____ {key} spec: {spec_key} / {alloc_spec} ")
-            value: TensorStorageMetadata
-            if value.size.numel() == 1:
-                p0(f"len 1 {key}")
-                state_dict[key] = alloc_tensor(value.properties, value.size)
-            else:
-                p0(f"len >1 {key}")
-                state_dict[key] = _shard_tensor(
-                    alloc_tensor(value.properties, alloc_spec[1]),
-                    sharding_spec=tp_spec, 
-                    process_group=fsdp_pg
-                )
+            alloc_size = layout_specs.get(spec_key, (None, value.size))[1]
 
-                # state_dict[key] = _shard_tensor(alloc_tensor(value.properties, alloc_spec[1]), alloc_spec[2], process_group=alloc_spec[3])
-                if alloc_spec[0] is not None:
-                    # and dist.get_rank() in [0, 2] and 
-                    if key.endswith("exp_avg"):
-                        print(f"{dist.get_rank()} {key} {state_dict[key].metadata()}")
-                    offset_info[key] = alloc_spec[0]
+            state_dict[key] = _shard_tensor(
+                alloc_tensor(value.properties, alloc_size),
+                sharding_spec=tp_spec, 
+                process_group=fsdp_pg
+            )
 
     # Whether we unflatten before or after doesn't matter
     dist_cp.load_state_dict(
         state_dict=state_dict,
         storage_reader=dist_cp.FileSystemReader("checkpoint"),
-        planner=ReaderWithOffset(offset_info)
+        planner=ReaderWithOffset(layout_specs)
     )
-
-    dist.barrier()
-    # if dist.get_rank() in [0, 2]:
-    exp_avg = state_dict["state.net1.weight.exp_avg"]
-    exp_avg_bias = state_dict["state.net1.bias.exp_avg"]
-    print(f"mid-load {dist.get_rank()} {exp_avg.local_tensor()}")
-    print(f"bias-mid-load {dist.get_rank()} {exp_avg_bias.local_tensor()}")
-        
-    #  and new_li.dest_index.fqn.endswith("exp_avg"):
 
     state_dict = unflatten_state_dict(state_dict, metadata.planner_data)
 
-    # if dist.get_rank() == 0:
-        # print("optimizer sharded state dict")
-        # traverse_state_dict(state_dict, print_visitor)
     return state_dict
 
 def load_2d_optim():
@@ -401,21 +373,16 @@ def load_2d_optim():
     optim_input = list(model_tp.parameters())
     optim = torch.optim.Adam(optim_input, lr=0.0001)
 
-    dist.barrier()
-    p0("-----------------------------")
-
     with FSDP.state_dict_type(model_tp, StateDictType.SHARDED_STATE_DICT):
         model_state_dict = model_tp.state_dict()
         optim_state = load_2d_optimizer_state_dict(dp_pg, model_state_dict)
-
-        exp_avg = optim_state["state"]["net1.weight"]["exp_avg"]
-        print(f"before-flatening ({dist.get_rank()}) {exp_avg.local_tensor()}")
 
         flattened_osd = FSDP.flatten_sharded_optim_state_dict(
             optim_state, model_tp, optim_input, dp_pg
         )
 
         optim.load_state_dict(flattened_osd)
+
     exp_avg = optim.state_dict()["state"][0]["exp_avg"]
     print(f"[[{dist.get_rank()}]] after_load state: {exp_avg}")
 
@@ -424,8 +391,6 @@ def work():
     # load_2d_model()
 
     save_2d_optim()
-    if dist.get_rank() == 0:
-        no_dist_explore_state_dict()
     load_2d_optim()
 
 def load_checkpoint_nodist():
