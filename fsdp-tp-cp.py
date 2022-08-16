@@ -252,7 +252,7 @@ def alloc_tensor(props: TensorProperties, size: torch.Size):
         layout=props.layout,
         requires_grad=props.requires_grad,
         pin_memory=props.pin_memory,
-        device=torch.cuda.current_device()
+        device=torch.cuda.current_device() # FIXME probably makes sense to load this in CPU memory since it's transient memory
     )
 
 def key_stars_with(key, prefixes):
@@ -332,10 +332,10 @@ def load_2d_optimizer_state_dict(fsdp_pg, model_state_dict):
     prefix = [ "state", "param_groups" ]
     metadata = dist_cp.FileSystemReader("checkpoint").read_metadata()
 
-    tp_spec = create_colwise_spec(fsdp_pg)
-    state_dict = {}
     layout_specs = get_state_dict_2d_layout(model_state_dict)
-
+    tp_spec = create_colwise_spec(fsdp_pg)
+    # Create a state_dict for optimizer state
+    state_dict = {}
     for key, value in metadata.state_dict_metadata.items():
         if not key_stars_with(key, prefix):
             continue
@@ -386,12 +386,6 @@ def load_2d_optim():
     exp_avg = optim.state_dict()["state"][0]["exp_avg"]
     print(f"[[{dist.get_rank()}]] after_load state: {exp_avg}")
 
-def work():
-    # save_2d_model()
-    # load_2d_model()
-
-    save_2d_optim()
-    load_2d_optim()
 
 def load_checkpoint_nodist():
     metadata = dist_cp.FileSystemReader("checkpoint").read_metadata()
@@ -411,10 +405,8 @@ def load_checkpoint_nodist():
     )
     return unflatten_state_dict(state_dict, metadata.planner_data)
 
-
 def no_dist_explore_state_dict():
     checkpoint = load_checkpoint_nodist()
-
     """
     When looking at the output of the sharded state note the following:
 
@@ -434,25 +426,15 @@ def no_dist_explore_state_dict():
     print(checkpoint["state"]["net1.weight"]["exp_avg"])
     print(checkpoint["state"]["net1.bias"]["exp_avg"])
 
+def work():
+    # save_2d_model()
+    # load_2d_model()
+
+    save_2d_optim()
+    # if dist.get_rank() == 0:
+    #     no_dist_explore_state_dict()
+    load_2d_optim()
 
 if __name__ == "__main__":
-    # no_dist_explore_state_dict()
     shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
     dist_run(work, world_size=4)
-
-
-
-def run_model_locally():
-    torch.manual_seed(107)
-    model = MyModel().cuda()
-    optim_input = list(model.parameters())
-    optim = torch.optim.Adam(optim_input, lr=0.0001)
-
-    model(torch.rand(4).cuda()).mean().backward()
-
-
-    optim.step()
-    # exp_avg = optim.state_dict()["state"][0]["exp_avg"]
-    # print(f"[[--]] before-save state: {exp_avg}")
-    print(optim.state_dict())
-
