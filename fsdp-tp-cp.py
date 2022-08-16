@@ -1,3 +1,7 @@
+from contextlib import contextmanager
+import copy
+import dataclasses
+from functools import partial
 import shutil
 import os
 from typing import Tuple
@@ -6,13 +10,21 @@ import torch
 import torch.distributed as dist
 
 from torch.distributed._shard import shard_parameter
-from torch.distributed._shard.checkpoint.metadata import BytesStorageMetadata, TensorStorageMetadata
+from torch.distributed._shard.api import shard_module
+from torch.distributed._shard.checkpoint.planner import LoadPlan
+from torch.distributed._shard.checkpoint.default_planner import DefaultLoadPlanner
+from torch.distributed._shard.checkpoint.metadata import BytesStorageMetadata, MetadataIndex, TensorStorageMetadata
+from torch.distributed._shard.metadata import ShardMetadata
+from torch.distributed._shard.sharded_tensor.api import ShardedTensor
 from torch.distributed._shard.sharded_tensor.metadata import TensorProperties
+from torch.distributed._shard.sharded_tensor.shard import Shard
+from torch.distributed._shard.sharding_plan.api import ShardingPlan
 from torch.distributed._shard.sharding_spec.chunk_sharding_spec import ChunkShardingSpec
 
 from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+from torch.distributed._shard.api import _shard_tensor
 
 
 import torch.distributed._shard.checkpoint as dist_cp
@@ -24,10 +36,12 @@ from distcp_playground.utils import (
 
 from distcp_playground.dist_2d import (
     NestedTensorSaver,
-    NestedTensorLoader
+    NestedTensorLoader,
+    NestedRenamingTensorSaver
 )
 
 from distcp_playground.run import dist_run
+from distcp_playground.nested import unflatten_state_dict
 
 """
 This example shows how to load / save models wrapped with FSDP using
@@ -45,18 +59,53 @@ It has the following features merged into:
 TP_DEGREE = 2
 CHECKPOINT_DIR = f"/scratch/{os.environ['LOGNAME']}/checkpoint"
 
+class MyModel(torch.nn.Module):
+    def __init__(self):
+        super(MyModel, self).__init__()
+        self.net1 = torch.nn.Linear(4, 4)
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        return self.sigmoid(self.net1(x))
+
 def p0(line):
     if dist.get_rank() == 0:
         print(line)
 
+
+def module_sharding_plan(colwise_spec):
+    return ShardingPlan(
+        plan={
+            "net1.weight": colwise_spec,
+        },
+        return_local_tensor=["net1"],
+    )
+
+def _params_fsdp_flat_order(m, params_sharded, tp_world_size):
+    params = {}
+    sharding_info = {}
+    for name, param in m.named_parameters():
+        if name not in params_sharded:
+            params[name] = param.view(-1).size(0)
+        else:
+            params[name] = param.view(-1).size(0) // tp_world_size
+            sharding_info[name] = (param.size(), 0 if "net1" in name else 1)
+    return params, sharding_info
+
+OPS_NOT_SHARD = []
+SHARD_PARAMS = [ "net1.weight"]
+
 def init_model():
-    model = torch.nn.Linear(4, 8).cuda()
-    model = FSDP(model)
+    tp_pg, dp_pg = create_2d_process_groups(TP_DEGREE)
+    model_tp = MyModel().cuda()
 
-    optim_input = list(model.parameters())
-    optim = torch.optim.Adam(optim_input, lr=0.0001)
+    sharding_spec = create_colwise_spec(tp_pg)
+    sharding_plan = module_sharding_plan(sharding_spec)
+    shard_module(model_tp, sharding_plan, process_group=tp_pg)
+    model_tp = FSDP(model_tp, process_group=dp_pg)
 
-    return model, optim, optim_input
+    return model_tp, tp_pg, dp_pg
+
 
 def create_2d_process_groups(tp_degree) -> Tuple[dist.ProcessGroup, dist.ProcessGroup]:
     """
@@ -103,12 +152,7 @@ def create_colwise_spec(pg):
 
 def save_2d_model():
     torch.manual_seed(101)
-    tp_pg, dp_pg = create_2d_process_groups(TP_DEGREE)
-
-    model_tp = torch.nn.Linear(4, 4).cuda()
-    sharding_spec = create_colwise_spec(tp_pg)
-    shard_parameter(model_tp, "weight", sharding_spec, process_group=tp_pg)
-    model_tp = FSDP(model_tp, process_group=dp_pg)
+    model_tp, tp_pg, dp_pg = init_model()
 
     with FSDP.summon_full_params(model_tp):
         print(f"{dist.get_rank()} :: before-save: {model_tp.weight.local_tensor()}")
@@ -124,13 +168,7 @@ def save_2d_model():
 
 def load_2d_model():
     torch.manual_seed(101)
-    tp_pg, dp_pg = create_2d_process_groups(TP_DEGREE)
-
-    model_tp = torch.nn.Linear(4, 4).cuda()
-    sharding_spec = create_colwise_spec(tp_pg)
-    shard_parameter(model_tp, "weight", sharding_spec, process_group=tp_pg)
-    model_tp = FSDP(model_tp, process_group=dp_pg)
-
+    model_tp, tp_pg, dp_pg = init_model()
 
     dist.barrier()
 
@@ -144,43 +182,302 @@ def load_2d_model():
     with FSDP.summon_full_params(model_tp):
         print(f"{dist.get_rank()} :: after-load: {model_tp.weight.local_tensor()}")
 
-def work():
-    save_2d_model()
-    load_2d_model()
 
-    # save_sharded_optim()
-    # load_sharded_optim()
+def print_tensor(value, padding="", prefix=""):
+    if isinstance(value, ShardedTensor):
+        print(f"{padding}{prefix}ShardedTensor size {value.size()}")
+        for shard in value.local_shards():
+            print_tensor(shard.tensor, f"{padding}\t", f"{shard.metadata.shard_offsets} ")
+    else:
+        print(f"{padding}{prefix}Tensor size {value.size()}")
+
+def print_sharded_tensor(path, value):
+    if not isinstance(value, ShardedTensor):
+        print_visitor(path, value)
+    else:
+        print_tensor(value, prefix=path)
+
+
+def _sync_tp_module_grads(m, tp_pg, params_fsdp_flat_order):
+    fsdp_world_size = int(dist.get_world_size() // tp_pg.size())
+    # TP handles gradients differently from FSDP. We need to divide by tp_pg size.
+    for p in m.parameters():
+        all_params = [torch.zeros_like(p) for _ in range(fsdp_world_size)]
+        splits = tuple(params_fsdp_flat_order.values())
+        all_params = torch.cat(all_params).contiguous().split(splits)
+        for idx, key in enumerate(params_fsdp_flat_order.keys()):
+            if key not in OPS_NOT_SHARD:
+                all_params[idx][:] = 1
+        all_params = torch.cat(all_params).contiguous().type(torch.BoolTensor)
+        cur_param = all_params.chunk(fsdp_world_size)[dist.get_rank() // tp_pg.size()]
+        # We want to sync the layer 3 to make it same as FSDP only case.
+        p_grad_device = p.grad.device
+        p_grad = p.grad.clone().detach()
+        p_grad = p_grad.cuda(dist.get_rank())
+        dist.all_reduce(p_grad, op=dist.ReduceOp.SUM, group=tp_pg)
+        p_grad = p_grad.to(p_grad_device)
+        p.grad[~cur_param] = p_grad[~cur_param]
+        # Sharded Tensor add up all gradients, so we need to do average.
+        p.grad /= tp_pg.size()
+
+
+def save_2d_optim():
+    torch.manual_seed(107)
+    model_tp, tp_pg, dp_pg = init_model()
+    optim_input = list(model_tp.parameters())
+    optim = torch.optim.Adam(optim_input, lr=0.0001)
+
+    model_tp(torch.rand(4).cuda()).sum().backward()
+
+    optim.step()
+    exp_avg = optim.state_dict()["state"][0]["exp_avg"]
+    print(f"[[{dist.get_rank()}]] before-save state: {exp_avg}")
+
+    optim_state = FSDP.sharded_optim_state_dict(model_tp, optim, optim_input)
+
+    md = dist_cp.save_state_dict(
+        state_dict=optim_state,
+        storage_writer=dist_cp.FileSystemWriter("checkpoint"),
+        planner=NestedRenamingTensorSaver()
+    )
+
+def alloc_tensor(props: TensorProperties, size: torch.Size):
+    return torch.empty(
+        size=size,
+        dtype=props.dtype,
+        layout=props.layout,
+        requires_grad=props.requires_grad,
+        pin_memory=props.pin_memory,
+        device=torch.cuda.current_device()
+    )
+
+def key_stars_with(key, prefixes):
+    return any(key.startswith(p) for p in prefixes)
+
+def element_wise_add(a, b):
+    return [i_a + i_b for i_a, i_b in zip(a,b)]
+
+def element_wise_sub(a, b):
+    return [i_a - i_b for i_a, i_b in zip(a,b)]
+
+
+from torch.distributed._shard.checkpoint.resharding import(
+    create_read_items,
+    _create_sharded_read_items
+)
+
+class ReaderWithOffset(DefaultLoadPlanner):
+    def __init__(self, offsets) -> None:
+        super().__init__()
+        self.offsets = offsets
+    
+    def create_local_plan(self) -> LoadPlan:
+        requests = []
+        self.translation = {}
+        for fqn, obj in self.state_dict.items():
+            md = self.metadata.state_dict_metadata[fqn]
+            if not isinstance(obj, ShardedTensor):
+                requests += create_read_items(fqn, md, obj)
+                continue
+            if fqn not in self.offsets:
+                # p0(f"{fqn} has no offsets")
+                requests += create_read_items(fqn, md, obj)
+                continue
+            
+            p0(f"{fqn} has offsets, off we go! (pun intended)")
+            offset = self.offsets[fqn]
+            # requests += create_read_items(fqn, md, obj)
+            assert len(obj.local_shards()) == 1
+            original_shard = obj.local_shards()[0]
+            shard_md = copy.deepcopy(original_shard.metadata)
+            shard_md.shard_offsets = element_wise_add(shard_md.shard_offsets, offset)
+            local_shards = [Shard(original_shard.tensor, shard_md)]
+
+            reqs = _create_sharded_read_items(fqn, md, local_shards)
+            for wi in reqs:
+                original_offset = element_wise_sub(wi.dest_index.offset, offset)
+                
+                original_index = dataclasses.replace(wi.dest_index, offset=torch.Size(original_offset))
+                self.translation[wi.dest_index] = original_index
+                if fqn.endswith("exp_avg"):
+                    print(f"[{dist.get_rank()}] >> {wi} / ({original_index})")
+                
+            requests += reqs
+        return LoadPlan(requests)
+
+    def lookup_tensor(self, index: MetadataIndex) -> torch.Tensor:
+        return super().lookup_tensor(self.translation.get(index, index))
+
+def load_2d_optimizer_state_dict(fsdp_pg, model_state_dict):
+    prefix = [ "state", "param_groups" ]
+    metadata = dist_cp.FileSystemReader("checkpoint").read_metadata()
+    global_spec = ChunkShardingSpec(
+        dim=0,
+        placements=[f"rank:{i}/cuda:{i}" for i in range(dist.get_world_size())]
+    )
+    tp_spec = create_colwise_spec(fsdp_pg)
+
+    state_dict = {}
+    # if dist.get_rank() == 0:
+    #     traverse_state_dict(model_state_dict, print_sharded_tensor)
+    #     print(metadata)
+    specs = {}
+
+    """
+    We have to load the right TP slice of the optimizer state.
+    This is not easy since the per-tensor slicing is not public and deterministic.
+        We take advantage of the state dict producing a sliced ST to figure out what we need to load.
+
+    This is pretty fragile and it might be easier for FSDP tod it as it has all this info
+    """
+    for key,value in model_state_dict.items():
+        if isinstance(value, ShardedTensor):
+            if isinstance(value.local_shards()[0].tensor, ShardedTensor):
+                shard = value.local_shards()[0]
+                specs[key] = (shard.metadata.shard_offsets, shard.metadata.shard_sizes, tp_spec, fsdp_pg)
+
+            else:
+                specs[key] = (None, value.size(), global_spec, None)
+        elif isinstance(value, torch.Tensor):
+            specs[key] = (None, value.size(), global_spec, None)
+
+
+    offset_info = {}
+    for key, value in metadata.state_dict_metadata.items():
+        if not key_stars_with(key, prefix):
+            continue
+        if isinstance(value, BytesStorageMetadata):
+            state_dict[key] = "<bytes_io>"
+        else:
+            # this is a hack to extract the model FQN from the optimizer state key. IE for state.foo.bar.exp_avg we want foo.bar
+            spec_key = key[6:key.rindex('.')]
+            alloc_spec = specs.get(spec_key, (None, value.size, global_spec, None))
+            # p0(f"____ {key} spec: {spec_key} / {alloc_spec} ")
+            value: TensorStorageMetadata
+            if len(value.chunks) == 1:
+                state_dict[key] = alloc_tensor(value.properties, value.size)
+            else:
+                state_dict[key] = _shard_tensor(alloc_tensor(value.properties, alloc_spec[1]), alloc_spec[2], process_group=alloc_spec[3])
+                if alloc_spec[0] is not None:
+                    # and dist.get_rank() in [0, 2] and 
+                    if key.endswith("exp_avg"):
+                        print(f"{dist.get_rank()} {key} {state_dict[key].metadata()}")
+                    offset_info[key] = alloc_spec[0]
+
+    # Whether we unflatten before or after doesn't matter
+    dist_cp.load_state_dict(
+        state_dict=state_dict,
+        storage_reader=dist_cp.FileSystemReader("checkpoint"),
+        planner=ReaderWithOffset(offset_info)
+    )
+
+    dist.barrier()
+    # if dist.get_rank() in [0, 2]:
+    exp_avg = state_dict["state.net1.weight.exp_avg"]
+    print(f"mid-load {dist.get_rank()} {exp_avg.local_tensor()}")
+        
+    #  and new_li.dest_index.fqn.endswith("exp_avg"):
+
+    state_dict = unflatten_state_dict(state_dict, metadata.planner_data)
+
+    # if dist.get_rank() == 0:
+        # print("optimizer sharded state dict")
+        # traverse_state_dict(state_dict, print_visitor)
+    return state_dict
+
+def load_2d_optim():
+    torch.manual_seed(103)
+    model_tp, tp_pg, dp_pg = init_model()
+    optim_input = list(model_tp.parameters())
+    optim = torch.optim.Adam(optim_input, lr=0.0001)
+
+    dist.barrier()
+    p0("-----------------------------")
+
+    with FSDP.state_dict_type(model_tp, StateDictType.SHARDED_STATE_DICT):
+        model_state_dict = model_tp.state_dict()
+        optim_state = load_2d_optimizer_state_dict(dp_pg, model_state_dict)
+
+        exp_avg = optim_state["state"]["net1.weight"]["exp_avg"]
+        print(f"before-flatening ({dist.get_rank()}) {exp_avg.local_tensor()}")
+
+        flattened_osd = FSDP.flatten_sharded_optim_state_dict(
+            optim_state, model_tp, optim_input, dp_pg
+        )
+
+        optim.load_state_dict(flattened_osd)
+    exp_avg = optim.state_dict()["state"][0]["exp_avg"]
+    print(f"[[{dist.get_rank()}]] after_load state: {exp_avg}")
+
+def work():
+    # save_2d_model()
+    # load_2d_model()
+
+    save_2d_optim()
+    if dist.get_rank() == 0:
+        no_dist_explore_state_dict()
+    load_2d_optim()
+
+def load_checkpoint_nodist():
+    metadata = dist_cp.FileSystemReader("checkpoint").read_metadata()
+
+    state_dict = {}
+    for key, value in metadata.state_dict_metadata.items():
+        if isinstance(value, BytesStorageMetadata):
+            state_dict[key] = "<bytes_io>"
+        else:
+            value: TensorStorageMetadata
+            state_dict[key] = alloc_tensor(value.properties, value.size)
+
+    dist_cp.load_state_dict(
+        state_dict=state_dict,
+        storage_reader=dist_cp.FileSystemReader("checkpoint"),
+        no_dist=True
+    )
+    return unflatten_state_dict(state_dict, metadata.planner_data)
+
+
+def no_dist_explore_state_dict():
+    checkpoint = load_checkpoint_nodist()
+
+    """
+    When looking at the output of the sharded state note the following:
+
+    net1.weight is sharded across FSDP groups
+    net1.bias is replicated across FSDP groups
+
+    FSDP groups are [0, 2] [1, 3] so the data is split in the following way:
+
+    notation: [index: length]
+    group0: weight [0: 8] bias [0: 4]
+        rank 0: weight [0: 6]
+        rank 2: weight [6: 2] bias [0: 4]
+    group0: weight [8: 8] bias [0: 4]
+        rank 0: weight [8: 6]
+        rank 2: weight [14: 2] bias [0: 4]
+    """
+    print(checkpoint["state"]["net1.weight"]["exp_avg"])
+    print(checkpoint["state"]["net1.bias"]["exp_avg"])
 
 
 if __name__ == "__main__":
+    # no_dist_explore_state_dict()
     shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
     dist_run(work, world_size=4)
 
-# class ShardedTensor:
-#     pass
-# class Shard:
-#     pass
 
-# tensor =[]
-# dp_tp = 1
-# tp_pg= 1
-# global_process_group=1
-# # {
-# #     "weights": ShardedTensor(
-# #         Shard("rank0", tensor[4]),
-# #         Shard("rank1", tensor[4]),
-# #     ),
-# #     "bias": ShardedTensor(
-# #         Shard("rank0", tensor[2]),
-# #         Shard("rank1", tensor[2]),
-# #     ),
-# # },
 
-# {
-#     "weights": ShardedTensor(
-#         Shard("fpdp0-rank0", tensor[2]),
-#         Shard("fpdp0-rank1", tensor[2]),
-#         Shard("fpdp1-rank0", tensor[2]),
-#         Shard("fpdp1-rank1", tensor[2]),
-#     ),
-# }
+def run_model_locally():
+    torch.manual_seed(107)
+    model = MyModel().cuda()
+    optim_input = list(model.parameters())
+    optim = torch.optim.Adam(optim_input, lr=0.0001)
+
+    model(torch.rand(4).cuda()).mean().backward()
+
+
+    optim.step()
+    # exp_avg = optim.state_dict()["state"][0]["exp_avg"]
+    # print(f"[[--]] before-save state: {exp_avg}")
+    print(optim.state_dict())
+
