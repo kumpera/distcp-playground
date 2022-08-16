@@ -1,6 +1,8 @@
 import copy
 import dataclasses
-from typing import Dict,Any, List
+from functools import reduce
+from typing import Dict,Any, List, Tuple
+from torch.distributed._shard.checkpoint.planner import SavePlan
 from torch.distributed._shard.sharded_tensor import shard
 
 from torch.distributed._shard.sharded_tensor.api import ShardedTensor
@@ -19,13 +21,12 @@ from torch.distributed._shard.checkpoint.default_planner import (
     DefaultSavePlanner
 )
 
+import distcp_playground.nested as cp_nested
+
 
 import torch
 
-def element_wise_add(a: torch.Size, b: torch.Size) -> torch.Size:
-    return torch.Size([i_a + i_b for i_a, i_b in zip(a,b)])
-
-def element_wise_add2(a: List[int], b: List[int]) -> List[int]:
+def element_wise_add(a: List[int], b: List[int]) -> List[int]:
     return [i_a + i_b for i_a, i_b in zip(a,b)]
 
 def flatten_sharded_tensors(state_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -52,11 +53,11 @@ def flatten_sharded_tensors(state_dict: Dict[str, Any]) -> Dict[str, Any]:
             Shard(
                 tensor=inner_shard.tensor,
                 metadata=ShardMetadata(
-                    shard_offsets=element_wise_add2(
+                    shard_offsets=element_wise_add(
                         outer_shard.metadata.shard_offsets, 
                         inner_shard.metadata.shard_offsets),
                     shard_sizes=inner_shard.metadata.shard_sizes,
-                    placement=f"rank:{dist.get_rank()}/cuda:{torch.cuda.current_device()}"
+                    placement=f"rank:{dist.get_rank()}/{inner_shard.tensor.device}"
                 ))
         ]
 
@@ -76,7 +77,7 @@ def flatten_sharded_tensors(state_dict: Dict[str, Any]) -> Dict[str, Any]:
         for inner_md in inner_st.metadata().shards_metadata:
             if inner_md.shard_offsets != inner_shard.metadata.shard_offsets:
                 st_meta.shards_metadata.append(ShardMetadata(
-                    shard_offsets=element_wise_add2(
+                    shard_offsets=element_wise_add(
                         outer_shard.metadata.shard_offsets, 
                         inner_md.shard_offsets),
                     shard_sizes=inner_md.shard_sizes,
@@ -96,10 +97,24 @@ def flatten_sharded_tensors(state_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 class NestedTensorSaver(DefaultSavePlanner):
     def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
-        self.original_state_dict = state_dict
         return super().init(flatten_sharded_tensors(state_dict), is_coordinator)
 
 class NestedTensorLoader(DefaultLoadPlanner):
     def init(self, state_dict: STATE_DICT_TYPE, metadata: Metadata, is_coordinator: bool) -> None:
-        self.original_state_dict = state_dict
         return super().init(flatten_sharded_tensors(state_dict), metadata, is_coordinator)
+
+class NestedRenamingTensorSaver(DefaultSavePlanner):
+    def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
+        state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
+        state_dict = flatten_sharded_tensors(state_dict)
+        return super().init(state_dict, is_coordinator)
+
+    def create_local_plan(self) -> SavePlan:
+        plan = super().create_local_plan()
+        return dataclasses.replace(plan, planner_data=self.mappings)
+
+    def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+        global_plan, metadata = super().create_global_plan(all_plans)
+        merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
+        metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
+        return global_plan, metadata

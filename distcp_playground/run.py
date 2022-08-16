@@ -31,7 +31,7 @@ def worker(rank, run_fn, init_method, world_size):
     try:
         run_fn()
     except:
-        traceback.print_last()
+        traceback.print_exc()
 
     destroy_comms()
 
