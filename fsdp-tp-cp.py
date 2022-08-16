@@ -352,12 +352,20 @@ def load_2d_optimizer_state_dict(fsdp_pg, model_state_dict):
             # this is a hack to extract the model FQN from the optimizer state key. IE for state.foo.bar.exp_avg we want foo.bar
             spec_key = key[6:key.rindex('.')]
             alloc_spec = specs.get(spec_key, (None, value.size, global_spec, None))
-            # p0(f"____ {key} spec: {spec_key} / {alloc_spec} ")
+            p0(f"____ {key} spec: {spec_key} / {alloc_spec} ")
             value: TensorStorageMetadata
-            if len(value.chunks) == 1:
+            if value.size.numel() == 1:
+                p0(f"len 1 {key}")
                 state_dict[key] = alloc_tensor(value.properties, value.size)
             else:
-                state_dict[key] = _shard_tensor(alloc_tensor(value.properties, alloc_spec[1]), alloc_spec[2], process_group=alloc_spec[3])
+                p0(f"len >1 {key}")
+                state_dict[key] = _shard_tensor(
+                    alloc_tensor(value.properties, alloc_spec[1]),
+                    sharding_spec=tp_spec, 
+                    process_group=fsdp_pg
+                )
+
+                # state_dict[key] = _shard_tensor(alloc_tensor(value.properties, alloc_spec[1]), alloc_spec[2], process_group=alloc_spec[3])
                 if alloc_spec[0] is not None:
                     # and dist.get_rank() in [0, 2] and 
                     if key.endswith("exp_avg"):
@@ -374,7 +382,9 @@ def load_2d_optimizer_state_dict(fsdp_pg, model_state_dict):
     dist.barrier()
     # if dist.get_rank() in [0, 2]:
     exp_avg = state_dict["state.net1.weight.exp_avg"]
+    exp_avg_bias = state_dict["state.net1.bias.exp_avg"]
     print(f"mid-load {dist.get_rank()} {exp_avg.local_tensor()}")
+    print(f"bias-mid-load {dist.get_rank()} {exp_avg_bias.local_tensor()}")
         
     #  and new_li.dest_index.fqn.endswith("exp_avg"):
 

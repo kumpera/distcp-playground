@@ -45,7 +45,6 @@ def init_model():
     model = FSDP(model)
 
     optim_input = list(model.parameters())
-    # XXX how do I recover `optim_input` during checkpointing?
     optim = torch.optim.Adam(optim_input, lr=0.0001)
 
     return model, optim, optim_input
