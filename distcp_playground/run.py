@@ -1,3 +1,4 @@
+import logging
 import os
 import traceback
 import random
@@ -8,8 +9,6 @@ from torch.testing._internal.common_distributed import tp_transports
 
 
 def init_pg(rank, world_size):
-    import torch
-
     torch.distributed.init_process_group(
         backend="nccl",
         world_size=world_size,
@@ -51,6 +50,8 @@ def destroy_comms(options):
         dist.rpc.shutdown()
 
 def worker(rank, run_fn, options, world_size):
+    logging.basicConfig(filename=f"rank{rank}", level=logging.WARNING, force=True)
+    print(f"----DDD {rank}")
     init_comms(options, rank, world_size=world_size)
 
     try:

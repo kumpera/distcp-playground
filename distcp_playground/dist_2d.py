@@ -118,3 +118,35 @@ class NestedRenamingTensorSaver(DefaultSavePlanner):
         merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
         metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
         return global_plan, metadata
+
+
+class NestedDedupTensorSaver(DefaultSavePlanner):
+    def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
+        return super().init(flatten_sharded_tensors(state_dict), is_coordinator)
+
+    def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+        key_to_plan = {}
+        for plan_idx, plan in enumerate(all_plans):
+            for wi in plan.items:
+                key_to_plan.setdefault(wi.index, []).append(plan_idx)
+
+        replicated_items = { k: v for k,v in key_to_plan.items() if len(v) > 1}
+
+        # We're now presented with an interesting choice, how to remove duplicates
+        # We can 1) always keep first entry; 2)randomly keep one entry; 3) load balance across rank
+        # For now we do (1)
+        # Compute the per-rank remove set
+        plan_to_keys = {}
+        for key, plans in replicated_items.items():
+            for plan_idx in plans[1:]:
+                plan_to_keys.setdefault(plan_idx, []).append(key)
+
+        for plan_idx, keys in plan_to_keys.items():
+            print(f"plan {plan_idx} to remove {keys}")
+            key_set = set(keys)
+            # rewrite items and remove elements
+            new_items = [wi for wi in all_plans[plan_idx].items if wi.index not in key_set]
+            print(f"old items: {len(all_plans[plan_idx].items)} keys: {len(keys)} new: {len(new_items)}")
+            all_plans[plan_idx] = dataclasses.replace(all_plans[plan_idx], items=new_items)
+
+        return super().create_global_plan(all_plans)

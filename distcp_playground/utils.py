@@ -4,7 +4,8 @@ from typing import Mapping
 from torch.distributed._shard.checkpoint.metadata import (
     STATE_DICT_TYPE,
 )
-
+from torch.distributed._shard.sharded_tensor.api import ShardedTensor
+from spmd import  DTensor as DT
 
 def keep_visiting_tensors(value):
     return isinstance(value, torch.Tensor)
@@ -53,3 +54,23 @@ def traverse_state_dict(state_dict: STATE_DICT_TYPE, visitor, keep_traversing=ke
 
 def print_visitor(path, value, prefix=""):
     print(f"{prefix}[{path}] :: {type(value)}")
+
+
+def print_tensor(value, padding="", prefix=""):
+    if isinstance(value, ShardedTensor):
+        print(f"{padding}{prefix}ShardedTensor size {value.size()}")
+        for shard in value.local_shards():
+            print_tensor(shard.tensor, f"{padding}\t", f"{shard.metadata.shard_offsets} ")
+    elif isinstance(value, DT):
+        print(f"{padding}{prefix}DistributedTensor size {value.size()}")
+        # for shard in value.local_shards():
+        print_tensor(value.local_tensor, f"{padding}\t", f"(offset ???) ")
+    else:
+        print(f"{padding}{prefix}Tensor size {value.size()}")
+
+
+def print_sharded_tensor(path, value):
+    if not isinstance(value, ShardedTensor) and not isinstance(value, DT):
+        print_visitor(path, value)
+    else:
+        print_tensor(value, prefix=path)

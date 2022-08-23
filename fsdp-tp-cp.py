@@ -159,7 +159,7 @@ def save_2d_model():
     model_tp, tp_pg, dp_pg = init_model()
 
     with FSDP.summon_full_params(model_tp):
-        print(f"{dist.get_rank()} :: before-save: {model_tp.weight.local_tensor()}")
+        print(f"{dist.get_rank()} :: before-save: {model_tp.net1.weight.local_tensor()}")
 
     dist.barrier()
 
@@ -171,7 +171,7 @@ def save_2d_model():
             planner=NestedTensorSaver())
 
 def load_2d_model():
-    torch.manual_seed(101)
+    torch.manual_seed(103)
     model_tp, tp_pg, dp_pg = init_model()
 
     dist.barrier()
@@ -183,8 +183,10 @@ def load_2d_model():
             storage_reader=dist_cp.FileSystemReader(path=CHECKPOINT_DIR),
             planner=NestedTensorLoader())
 
+        model_tp.load_state_dict(checkpoint)
+
     with FSDP.summon_full_params(model_tp):
-        print(f"{dist.get_rank()} :: after-load: {model_tp.weight.local_tensor()}")
+        print(f"{dist.get_rank()} :: after-load: {model_tp.net1.weight.local_tensor()}")
 
 
 def print_tensor(value, padding="", prefix=""):
@@ -427,13 +429,16 @@ def no_dist_explore_state_dict():
     print(checkpoint["state"]["net1.bias"]["exp_avg"])
 
 def work():
-    # save_2d_model()
-    # load_2d_model()
+    dist.barrier()
+    p0("------------------")
+    dist.barrier()
+    save_2d_model()
+    load_2d_model()
 
-    save_2d_optim()
+    # save_2d_optim()
     # if dist.get_rank() == 0:
     #     no_dist_explore_state_dict()
-    load_2d_optim()
+    # load_2d_optim()
 
 if __name__ == "__main__":
     shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)

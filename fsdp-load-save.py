@@ -13,6 +13,7 @@ import torch.distributed._shard.checkpoint as dist_cp
 from distcp_playground.utils import (
     traverse_state_dict,
     print_visitor,
+    print_sharded_tensor
 )
 
 from distcp_playground.nested import (
@@ -71,6 +72,8 @@ def load_sharded_model():
     model, optim, optim_params = init_model()
     with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
         checkpoint = model.state_dict()
+        if dist.get_rank() == 0:
+            traverse_state_dict(checkpoint, print_sharded_tensor)
         dist_cp.load_state_dict(
             state_dict=checkpoint,
             storage_reader=dist_cp.FileSystemReader("checkpoint")
@@ -155,12 +158,11 @@ def load_sharded_optim():
     p0(f"after-load state: {optim.state_dict()}")
 
 def work():
+    save_sharded_model()
+    load_sharded_model()
 
-    # save_sharded_model()
-    # load_sharded_model()
-
-    save_sharded_optim()
-    load_sharded_optim()
+    # save_sharded_optim()
+    # load_sharded_optim()
 
 
 if __name__ == "__main__":
