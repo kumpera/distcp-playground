@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import copy
 import dataclasses
 from functools import reduce
@@ -119,11 +121,9 @@ def dedup_tensors(all_plans: List[SavePlan]) -> List[SavePlan]:
             plan_to_keys.setdefault(plan_idx, []).append(key)
 
     for plan_idx, keys in plan_to_keys.items():
-        # print(f"plan {plan_idx} to remove {keys}")
         key_set = set(keys)
         # rewrite items and remove elements
         new_items = [wi for wi in all_plans[plan_idx].items if wi.index not in key_set]
-        # print(f"old items: {len(all_plans[plan_idx].items)} keys: {len(keys)} new: {len(new_items)}")
         all_plans[plan_idx] = dataclasses.replace(all_plans[plan_idx], items=new_items)
     return all_plans
 
@@ -155,7 +155,7 @@ def get_state_dict_2d_layout(state_dict: STATE_DICT_TYPE) -> Dict[str, Tuple[Seq
     for key, value in state_dict.items():
         specs[key] = (None, value.size())
         if is_nested_tensor(value):
-            assert len(value.local_shards()) == 1, f"Cannot handle ST with multiple shards"
+            assert len(value.local_shards()) == 1, "Cannot handle ST with multiple shards"
             shard = value.local_shards()[0]
             specs[key] = (shard.metadata.shard_offsets, shard.metadata.shard_sizes)
 
@@ -198,7 +198,6 @@ def alloc_tensor(props: TensorProperties, size: torch.Size):
 # To sum up, the ST API is effing hard to work with and most of the data we pass in is useless
 def load_2d_optimizer_state_dict(model_state_dict, optimizer_prefixes, storage_reader, dp_pg):
     #FIXME this needs to be made general
-    # prefix = [ "state", "param_groups" ]
     metadata = storage_reader.read_metadata()
 
     layout_specs = get_state_dict_2d_layout(model_state_dict)
@@ -235,9 +234,9 @@ def load_2d_optimizer_state_dict(model_state_dict, optimizer_prefixes, storage_r
         if value.size.numel() == 1:
             state_dict[key] = alloc_tensor(value.properties, value.size)
         else:
-            # FIXME this is a hack to extract the model FQN from the optimizer state key. IE for state.foo.bar.exp_avg we want foo.bar
+            # FIXME this is a hack to extract the model FQN from the
+            #  optimizer state key. IE for state.foo.bar.exp_avg we want foo.bar
             spec_key = key[6:key.rindex('.')]
-            # print(f"{dist.get_rank()} WTF {spec_key} {layout_specs.get(spec_key)}")
             alloc_size = layout_specs.get(spec_key, (None, value.size))[1]
             st = _shard_tensor(
                 alloc_tensor(value.properties, alloc_size),
