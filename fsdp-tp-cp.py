@@ -37,7 +37,8 @@ from distcp_playground.utils import (
 from distcp_playground.dist_2d import (
     NestedTensorSaver,
     NestedTensorLoader,
-    NestedRenamingTensorSaver
+    NestedRenamingTensorSaver,
+    load_2d_optimizer_state_dict,
 )
 from torch.distributed._shard.checkpoint.resharding import(
     create_read_items,
@@ -188,21 +189,6 @@ def load_2d_model():
     with FSDP.summon_full_params(model_tp):
         print(f"{dist.get_rank()} :: after-load: {model_tp.net1.weight.local_tensor()}")
 
-
-def print_tensor(value, padding="", prefix=""):
-    if isinstance(value, ShardedTensor):
-        print(f"{padding}{prefix}ShardedTensor size {value.size()}")
-        for shard in value.local_shards():
-            print_tensor(shard.tensor, f"{padding}\t", f"{shard.metadata.shard_offsets} ")
-    else:
-        print(f"{padding}{prefix}Tensor size {value.size()}")
-
-def print_sharded_tensor(path, value):
-    if not isinstance(value, ShardedTensor):
-        print_visitor(path, value)
-    else:
-        print_tensor(value, prefix=path)
-
 def save_2d_optim():
     torch.manual_seed(107)
     model_tp, tp_pg, dp_pg = init_model()
@@ -219,131 +205,9 @@ def save_2d_optim():
 
     md = dist_cp.save_state_dict(
         state_dict=optim_state,
-        storage_writer=dist_cp.FileSystemWriter("checkpoint"),
+        storage_writer=dist_cp.FileSystemWriter(CHECKPOINT_DIR),
         planner=NestedRenamingTensorSaver()
     )
-
-def alloc_tensor(props: TensorProperties, size: torch.Size):
-    return torch.empty(
-        size=size,
-        dtype=props.dtype,
-        layout=props.layout,
-        requires_grad=props.requires_grad,
-        pin_memory=props.pin_memory,
-        device=torch.cuda.current_device() # FIXME probably makes sense to load this in CPU memory since it's transient memory
-    )
-
-def key_stars_with(key, prefixes):
-    return any(key.startswith(p) for p in prefixes)
-
-def element_wise_add(a, b):
-    return [i_a + i_b for i_a, i_b in zip(a,b)]
-
-def element_wise_sub(a, b):
-    return [i_a - i_b for i_a, i_b in zip(a,b)]
-
-class ReaderWithOffset(DefaultLoadPlanner):
-    def __init__(self, layout_specs) -> None:
-        super().__init__()
-        # str ->tuple(offset, size)
-        self.layout_specs = layout_specs
-    
-    def create_local_plan(self) -> LoadPlan:
-        requests = []
-        self.translation = {}
-        for fqn, obj in self.state_dict.items():
-            md = self.metadata.state_dict_metadata[fqn]
-            if not isinstance(obj, ShardedTensor):
-                requests += create_read_items(fqn, md, obj)
-                continue
-            if fqn not in self.layout_specs:
-                requests += create_read_items(fqn, md, obj)
-                continue
-            
-            offset = self.layout_specs[fqn][0]
-
-            assert len(obj.local_shards()) == 1
-            original_shard = obj.local_shards()[0]
-            shard_md = copy.deepcopy(original_shard.metadata)
-            shard_md.shard_offsets = element_wise_add(shard_md.shard_offsets, offset)
-            local_shards = [Shard(original_shard.tensor, shard_md)]
-
-            reqs = _create_sharded_read_items(fqn, md, local_shards)
-            # The WriteItems will have a displaced MetadataIndex, fix it.
-            # BTW, we should change _create_sharded_read_items to have more ergnomic API
-            for wi in reqs:
-                original_offset = element_wise_sub(wi.dest_index.offset, offset)
-                original_index = dataclasses.replace(wi.dest_index, offset=torch.Size(original_offset))
-                self.translation[wi.dest_index] = original_index
-
-            requests += reqs
-        return LoadPlan(requests)
-
-    def lookup_tensor(self, index: MetadataIndex) -> torch.Tensor:
-        return super().lookup_tensor(self.translation.get(index, index))
-
-def is_nested_sharded_tensor(val: Any) -> bool:
-    return isinstance(val, ShardedTensor) and isinstance(val.local_shards()[0].tensor, ShardedTensor)
-
-def get_state_dict_2d_layout(state_dict: STATE_DICT_TYPE) -> Dict[str, Tuple[Sequence[int], Sequence[int]]]:
-    """
-    We have to load the right TP slice of the optimizer state.
-    This is not easy since the per-tensor slicing can't be inferred from checkpoint metadata.
-    We take advantage of the model state_dict producing a sliced ST to figure out what we need to load.
-    This is pretty fragile and it might be easier for FSDP to compute this info for us.
-
-    Returns a dictionary where keys are the same of the state_dict and the value is a tuple of
-    (offset, size) for the current rank TP slice.
-
-    N.B. The state_dict *MUST* come from FSDP.sharded_state_dict.
-    """
-    specs = {}
-    for key, value in state_dict.items():
-        specs[key] = (None, value.size())
-        if is_nested_sharded_tensor(value):
-            shard = value.local_shards()[0]
-            specs[key] = (shard.metadata.shard_offsets, shard.metadata.shard_sizes)
-    return specs
-
-def load_2d_optimizer_state_dict(fsdp_pg, model_state_dict):
-    #FIXME this needs to be made general
-    prefix = [ "state", "param_groups" ]
-    metadata = dist_cp.FileSystemReader("checkpoint").read_metadata()
-
-    layout_specs = get_state_dict_2d_layout(model_state_dict)
-    tp_spec = create_colwise_spec(fsdp_pg)
-    # Create a state_dict for optimizer state
-    state_dict = {}
-    for key, value in metadata.state_dict_metadata.items():
-        if not key_stars_with(key, prefix):
-            continue
-        if isinstance(value, BytesStorageMetadata):
-            state_dict[key] = "<bytes_io>"
-            continue
-        value: TensorStorageMetadata
-        if value.size.numel() == 1:
-            state_dict[key] = alloc_tensor(value.properties, value.size)
-        else:
-            # FIXME this is a hack to extract the model FQN from the optimizer state key. IE for state.foo.bar.exp_avg we want foo.bar
-            spec_key = key[6:key.rindex('.')]
-            alloc_size = layout_specs.get(spec_key, (None, value.size))[1]
-
-            state_dict[key] = _shard_tensor(
-                alloc_tensor(value.properties, alloc_size),
-                sharding_spec=tp_spec, 
-                process_group=fsdp_pg
-            )
-
-    # Whether we unflatten before or after doesn't matter
-    dist_cp.load_state_dict(
-        state_dict=state_dict,
-        storage_reader=dist_cp.FileSystemReader("checkpoint"),
-        planner=ReaderWithOffset(layout_specs)
-    )
-
-    state_dict = unflatten_state_dict(state_dict, metadata.planner_data)
-
-    return state_dict
 
 def load_2d_optim():
     torch.manual_seed(103)
@@ -353,7 +217,12 @@ def load_2d_optim():
 
     with FSDP.state_dict_type(model_tp, StateDictType.SHARDED_STATE_DICT):
         model_state_dict = model_tp.state_dict()
-        optim_state = load_2d_optimizer_state_dict(dp_pg, model_state_dict)
+        optim_state = load_2d_optimizer_state_dict(
+            model_state_dict=model_state_dict,
+            optimizer_prefixes={"state", "param_groups"},
+            storage_reader=dist_cp.FileSystemReader(CHECKPOINT_DIR), 
+            dp_pg=dp_pg
+        )
 
         flattened_osd = FSDP.flatten_sharded_optim_state_dict(
             optim_state, model_tp, optim_input, dp_pg
@@ -366,7 +235,7 @@ def load_2d_optim():
 
 
 def load_checkpoint_nodist():
-    metadata = dist_cp.FileSystemReader("checkpoint").read_metadata()
+    metadata = dist_cp.FileSystemReader(CHECKPOINT_DIR).read_metadata()
 
     state_dict = {}
     for key, value in metadata.state_dict_metadata.items():
@@ -378,7 +247,7 @@ def load_checkpoint_nodist():
 
     dist_cp.load_state_dict(
         state_dict=state_dict,
-        storage_reader=dist_cp.FileSystemReader("checkpoint"),
+        storage_reader=dist_cp.FileSystemReader(CHECKPOINT_DIR),
         no_dist=True
     )
     return unflatten_state_dict(state_dict, metadata.planner_data)
@@ -405,16 +274,13 @@ def no_dist_explore_state_dict():
     print(checkpoint["state"]["net1.bias"]["exp_avg"])
 
 def work():
-    dist.barrier()
-    p0("------------------")
-    dist.barrier()
-    save_2d_model()
-    load_2d_model()
+    # save_2d_model()
+    # load_2d_model()
 
-    # save_2d_optim()
+    save_2d_optim()
     # if dist.get_rank() == 0:
     #     no_dist_explore_state_dict()
-    # load_2d_optim()
+    load_2d_optim()
 
 if __name__ == "__main__":
     shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)

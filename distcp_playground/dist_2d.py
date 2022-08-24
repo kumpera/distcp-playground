@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 import copy
 import dataclasses
 from functools import reduce
