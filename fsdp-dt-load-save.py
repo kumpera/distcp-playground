@@ -29,6 +29,7 @@ from distcp_playground.dist_2d import (
     NestedRenamingTensorSaver,
     NestedDedupRenamingTensorSaver,
     load_2d_optimizer_state_dict,
+    get_data_parallel_process_group,
 )
 
 from distcp_playground.run import dist_run
@@ -270,6 +271,11 @@ def load_dt_optim():
     model_tp = init_model()
     optim_input = list(model_tp.parameters())
     optim = torch.optim.Adam(optim_input, lr=0.0001)
+
+
+    the_pg = get_data_parallel_process_group(model_tp)
+
+    assert the_pg == DP_PG
 
     with FSDP.state_dict_type(model_tp, StateDictType.SHARDED_STATE_DICT):
         model_state_dict = model_tp.state_dict()

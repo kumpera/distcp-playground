@@ -83,6 +83,6 @@ LOGGER_INIT=False
 def get_logger():
     global LOGGER_INIT
     if not LOGGER_INIT:
-        logger.addHandler(logging.FileHandler(f"checkpoints/{torch.distributed.get_rank()}.log", "w+"))
+        # logger.addHandler(logging.FileHandler(f"checkpoints/{torch.distributed.get_rank()}.log", "w+"))
         LOGGER_INIT = True
     return logger

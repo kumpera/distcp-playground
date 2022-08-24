@@ -1,9 +1,10 @@
 import copy
 import dataclasses
 from functools import reduce, partial
+import io
 from pickle import FALSE
 from typing import Dict,Any, List, Sequence, Tuple
-from torch.distributed._shard.checkpoint.planner import LoadPlan, SavePlan
+from torch.distributed._shard.checkpoint.planner import LoadPlan, ReadItem, SavePlan
 from torch.distributed._shard.sharded_tensor import shard
 
 from torch.distributed._shard.sharded_tensor.api import ShardedTensor
@@ -11,7 +12,7 @@ import torch.distributed as dist
 import torch.distributed._shard.checkpoint as dist_cp
 from torch.distributed._shard.checkpoint.metadata import BytesStorageMetadata, Metadata, MetadataIndex, STATE_DICT_TYPE, TensorStorageMetadata
 from torch.distributed._shard.checkpoint.resharding import _create_sharded_read_items, create_read_items, create_write_items
-from torch.distributed._shard.checkpoint.utils import find_state_dict_object
+from torch.distributed._shard.checkpoint.utils import find_state_dict_object, find_tensor_shard
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor.metadata import ShardedTensorMetadata, TensorProperties
 from torch.distributed._shard.sharded_tensor.shard import Shard
@@ -196,6 +197,18 @@ def alloc_tensor(props: TensorProperties, size: torch.Size):
         device=torch.cuda.current_device()
     )
 
+def get_data_parallel_process_group(model: torch.nn.Module):
+    from torch.distributed.fsdp._optim_utils import _get_flat_param_to_fsdp_module
+
+    mods = _get_flat_param_to_fsdp_module(model)
+    the_pg = None
+    for module in mods.values():
+        if module.process_group is not None:
+            if the_pg is not None and module.process_group != the_pg:
+                raise ValueError("Mismatch DP groups")
+            the_pg = module.process_group
+    return the_pg
+
 # TODO enable device control (right now we use CUDA whenever possible)
 # Picking a device is not easy as we need to know the PG backend capabilities
 # And cuda is even worse cuz we have to hardcode whether we're using CUDA_VISIBLE_DEVICES or not
@@ -264,61 +277,61 @@ def load_2d_optimizer_state_dict(model_state_dict, optimizer_prefixes, storage_r
 
     return state_dict
 
-# class NestedTensorSaver(DefaultSavePlanner):
-#     def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
-#         return super().init(flatten_sharded_tensors(state_dict), is_coordinator)
+class NestedTensorSaver(DefaultSavePlanner):
+    def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
+        return super().init(flatten_sharded_tensors(state_dict), is_coordinator)
 
 class NestedTensorLoader(DefaultLoadPlanner):
     def init(self, state_dict: STATE_DICT_TYPE, metadata: Metadata, is_coordinator: bool) -> None:
         return super().init(flatten_sharded_tensors(state_dict), metadata, is_coordinator)
 
-# class NestedRenamingTensorSaver(DefaultSavePlanner):
-#     def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
-#         state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
-#         state_dict = flatten_sharded_tensors(state_dict)
-#         return super().init(state_dict, is_coordinator)
+class NestedRenamingTensorSaver(DefaultSavePlanner):
+    def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
+        state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
+        state_dict = flatten_sharded_tensors(state_dict)
+        return super().init(state_dict, is_coordinator)
 
-#     def create_local_plan(self) -> SavePlan:
-#         plan = super().create_local_plan()
-#         return dataclasses.replace(plan, planner_data=self.mappings)
+    def create_local_plan(self) -> SavePlan:
+        plan = super().create_local_plan()
+        return dataclasses.replace(plan, planner_data=self.mappings)
 
-#     def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
-#         global_plan, metadata = super().create_global_plan(all_plans)
-#         merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
-#         metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
-#         return global_plan, metadata
+    def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+        global_plan, metadata = super().create_global_plan(all_plans)
+        merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
+        metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
+        return global_plan, metadata
 
 
 def print_to_log(log_line):
     get_logger().info(f"{dist.get_rank()} :: {log_line}")
 
-# class NestedDedupTensorSaver(DefaultSavePlanner):
-#     def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
-#         # traverse_state_dict(state_dict, partial(print_sharded_tensor, print_fun=print_to_log))
-#         return super().init(flatten_sharded_tensors(state_dict), is_coordinator)
+class NestedDedupTensorSaver(DefaultSavePlanner):
+    def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
+        # traverse_state_dict(state_dict, partial(print_sharded_tensor, print_fun=print_to_log))
+        return super().init(flatten_sharded_tensors(state_dict), is_coordinator)
 
-#     def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
-#         all_plans = dedup_tensors(all_plans)
-#         return super().create_global_plan(all_plans)
+    def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+        all_plans = dedup_tensors(all_plans)
+        return super().create_global_plan(all_plans)
 
-# # This is ridiculous, lets just have UberSaver that a bucket of bools
-# class NestedDedupRenamingTensorSaver(DefaultSavePlanner):
-#     def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
-#         state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
-#         state_dict = flatten_sharded_tensors(state_dict)
-#         return super().init(state_dict, is_coordinator)
+# This is ridiculous, lets just have UberSaver that a bucket of bools
+class NestedDedupRenamingTensorSaver(DefaultSavePlanner):
+    def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
+        state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
+        state_dict = flatten_sharded_tensors(state_dict)
+        return super().init(state_dict, is_coordinator)
 
-#     def create_local_plan(self) -> SavePlan:
-#         plan = super().create_local_plan()
-#         return dataclasses.replace(plan, planner_data=self.mappings)
+    def create_local_plan(self) -> SavePlan:
+        plan = super().create_local_plan()
+        return dataclasses.replace(plan, planner_data=self.mappings)
 
-#     def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
-#         all_plans = dedup_tensors(all_plans)
-#         global_plan, metadata = super().create_global_plan(all_plans)
-#         merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
-#         self.metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
-#         get_logger().info(f">>>> mapping {merged_mappings}")
-#         return global_plan, self.metadata
+    def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+        all_plans = dedup_tensors(all_plans)
+        global_plan, metadata = super().create_global_plan(all_plans)
+        merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
+        self.metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
+        get_logger().info(f">>>> mapping {merged_mappings}")
+        return global_plan, self.metadata
 
 class UberSavePlanner(DefaultSavePlanner):
     def __init__(
@@ -356,6 +369,38 @@ class UberSavePlanner(DefaultSavePlanner):
             metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
 
         return global_plan, metadata
+
+class UberLoadPlanner(DefaultLoadPlanner):
+    def __init__(
+        self,
+        flatten_state_dict=True,
+        flatten_sharded_tensors=True,
+    ):
+        self.flatten_state_dict = flatten_state_dict
+        self.flatten_sharded_tensors = flatten_sharded_tensors
+
+    def init(self, state_dict: STATE_DICT_TYPE, metadata: Metadata, is_coordinator: bool) -> None:
+        self.original_state_dict = state_dict
+
+        if self.flatten_state_dict:
+            state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
+            self.checkpoint_mappings = metadata.planner_data
+
+        if self.flatten_sharded_tensors:
+            state_dict = flatten_sharded_tensors(state_dict)
+        return super().init(state_dict, metadata, is_coordinator)
+
+    def load_bytes(self, read_item: ReadItem, value: io.BytesIO) -> None:
+        cp_nested.set_element(
+            self.original_state_dict,
+            self.checkpoint_mappings[read_item.dest_index.fqn],
+            torch.load(value)
+        )
+
+    def lookup_tensor(self, index: MetadataIndex) -> torch.Tensor:
+        # FIXME aren't checkpoint_mappings and mappings supposedly compatible? I don't remember why I need this
+        obj = cp_nested.get_element(self.original_state_dict, self.mappings[index.fqn])
+        return find_tensor_shard(obj, index)
 
 
 def element_wise_sub(a, b):
