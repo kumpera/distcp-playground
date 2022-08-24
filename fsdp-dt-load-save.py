@@ -26,6 +26,9 @@ from distcp_playground.utils import (
 from distcp_playground.dist_2d import (
     NestedTensorLoader,
     NestedDedupTensorSaver,
+    NestedRenamingTensorSaver,
+    NestedDedupRenamingTensorSaver,
+    load_2d_optimizer_state_dict,
 )
 
 from distcp_playground.run import dist_run
@@ -80,7 +83,6 @@ def _aggregate_local_tensor(module: torch.nn.Module) -> torch.nn.Module:
     module.register_forward_hook(hook_func)
     return module
 
-
 def _replicate_input_tensor(
     module: torch.nn.Module, device_mesh, replica_placement
 ) -> torch.nn.Module:
@@ -91,11 +93,8 @@ def _replicate_input_tensor(
     module.register_forward_pre_hook(hook_func)
     return module
 
-
 def _gradient_hook(param, grad):
-    print("grad._local_tensor", grad._local_tensor)
     param._local_tensor.grad = grad._local_tensor
-
 
 def shard_module(m, pg):
     start_idx = distributed_c10d._get_global_rank(pg, 0)
@@ -144,17 +143,16 @@ def _shard_wrap_module(module, module_shard, fsdp_wrap, tp_pg, fsdp_pg):
         return FSDP(module, process_group=distributed_c10d._get_default_group())
     return module
 
+TP_PG = None
+DP_PG = None
 
 def init_model():
     rank = dist.get_rank()
     torch.cuda.set_device(rank)
     world_size = dist.get_world_size()
 
-    # Use same seed so that each rank get the same model params.
-    # args = _get_args_for_script()
     model_parallel_size = TP_DEGREE
     model = SimpleModel().cuda(rank)
-    model_optim = _get_module_optim(model)
 
     tp_ids = []
     fsdp_ids = []
@@ -172,6 +170,10 @@ def init_model():
     data_parallel_pgs = [dist.new_group(ids) for ids in fsdp_ids]
     tp_pg = tp_pgs[rank // model_parallel_size]
     fsdp_pg = data_parallel_pgs[rank % model_parallel_size]
+    global TP_PG
+    global DP_PG
+    TP_PG = tp_pg
+    DP_PG = fsdp_pg
 
     # Create Input
     model = _shard_wrap_module(
@@ -217,14 +219,91 @@ def load_dt_model():
         p0(f"after-load: net1.bias {model.net1.bias}")
         p0(f"after-load: net2.bias {model.net2.bias}")
 
-def work():
-    save_dt_model()
-    load_dt_model()
+def save_dt_optim():
+    torch.manual_seed(107)
+    model_tp = init_model()
+    optim_input = list(model_tp.parameters())
+    optim = torch.optim.Adam(optim_input, lr=0.0001)
 
-    # save_sharded_optim()
-    # load_sharded_optim()
+    model_tp(torch.rand(5).cuda()).sum().backward()
+    optim.step()
+
+    optim_state = FSDP.sharded_optim_state_dict(model_tp, optim, optim_input)
+    net1_bias = optim_state["state"]["net1.bias"]["exp_avg"]
+    net2_bias = optim_state["state"]["net2.bias"]["exp_avg"]
+    net1_bias = net1_bias.local_tensor().local_tensor() 
+    net2_bias = net2_bias.local_tensor().local_tensor()
+    for i in range(dist.get_world_size()):
+        if i == dist.get_rank(): 
+            print(f"[[{dist.get_rank()}]] before-save optim-state: net1:{net1_bias} net2:{net2_bias}")
+        dist.barrier()
+
+    md = dist_cp.save_state_dict(
+        state_dict=optim_state,
+        storage_writer=dist_cp.FileSystemWriter(CHECKPOINT_DIR),
+        planner=NestedDedupRenamingTensorSaver()
+    )
+
+def dump_checkpoint():
+    dist.barrier()
+    if dist.get_rank() == 0:
+        metadata = dist_cp.FileSystemReader(CHECKPOINT_DIR).read_metadata()
+        load_keys = [ "state.net1.bias.exp_avg", "state.net2.bias.exp_avg" ]
+
+        state_dict = {}
+        for key in load_keys:
+            md = metadata.state_dict_metadata[key]
+            state_dict[key] = torch.zeros(md.size)
+
+        dist_cp.load_state_dict(
+            state_dict=state_dict,
+            storage_reader=dist_cp.FileSystemReader(CHECKPOINT_DIR),
+            no_dist=True
+        )
+
+        for key, value in state_dict.items():
+            print(f"{key} :: {value}")
+    dist.barrier()
+
+def load_dt_optim():
+    torch.manual_seed(103)
+    model_tp = init_model()
+    optim_input = list(model_tp.parameters())
+    optim = torch.optim.Adam(optim_input, lr=0.0001)
+
+    with FSDP.state_dict_type(model_tp, StateDictType.SHARDED_STATE_DICT):
+        model_state_dict = model_tp.state_dict()
+        optim_state = load_2d_optimizer_state_dict(
+            model_state_dict,
+            optimizer_prefixes={"state", "param_groups"},
+            storage_reader=dist_cp.FileSystemReader(CHECKPOINT_DIR), 
+            dp_pg=DP_PG
+        )
+
+        net1_bias = optim_state["state"]["net1.bias"]["exp_avg"]
+        net2_bias = optim_state["state"]["net2.bias"]["exp_avg"]
+        net1_bias = net1_bias.local_tensor()
+        net2_bias = net2_bias.local_tensor()
+        for i in range(dist.get_world_size()):
+            if i == dist.get_rank(): 
+                print(f"[[{dist.get_rank()}]] after-load optim-state: net1:{net1_bias} net2:{net2_bias}")
+            dist.barrier()
+
+        flattened_osd = FSDP.flatten_sharded_optim_state_dict(
+            optim_state, model_tp, optim_input, DP_PG
+        )
+
+        optim.load_state_dict(flattened_osd)
+
+
+def work():
+    # save_dt_model()
+    # load_dt_model()
+
+    save_dt_optim()
+    load_dt_optim()
 
 
 if __name__ == "__main__":
-    shutil.rmtree("checkpoint", ignore_errors=True)
+    shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
     dist_run(work, world_size=4)

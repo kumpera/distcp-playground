@@ -51,7 +51,6 @@ def destroy_comms(options):
 
 def worker(rank, run_fn, options, world_size):
     logging.basicConfig(filename=f"rank{rank}", level=logging.WARNING, force=True)
-    print(f"----DDD {rank}")
     init_comms(options, rank, world_size=world_size)
 
     try:

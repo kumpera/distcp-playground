@@ -203,30 +203,6 @@ def print_sharded_tensor(path, value):
     else:
         print_tensor(value, prefix=path)
 
-
-def _sync_tp_module_grads(m, tp_pg, params_fsdp_flat_order):
-    fsdp_world_size = int(dist.get_world_size() // tp_pg.size())
-    # TP handles gradients differently from FSDP. We need to divide by tp_pg size.
-    for p in m.parameters():
-        all_params = [torch.zeros_like(p) for _ in range(fsdp_world_size)]
-        splits = tuple(params_fsdp_flat_order.values())
-        all_params = torch.cat(all_params).contiguous().split(splits)
-        for idx, key in enumerate(params_fsdp_flat_order.keys()):
-            if key not in OPS_NOT_SHARD:
-                all_params[idx][:] = 1
-        all_params = torch.cat(all_params).contiguous().type(torch.BoolTensor)
-        cur_param = all_params.chunk(fsdp_world_size)[dist.get_rank() // tp_pg.size()]
-        # We want to sync the layer 3 to make it same as FSDP only case.
-        p_grad_device = p.grad.device
-        p_grad = p.grad.clone().detach()
-        p_grad = p_grad.cuda(dist.get_rank())
-        dist.all_reduce(p_grad, op=dist.ReduceOp.SUM, group=tp_pg)
-        p_grad = p_grad.to(p_grad_device)
-        p.grad[~cur_param] = p_grad[~cur_param]
-        # Sharded Tensor add up all gradients, so we need to do average.
-        p.grad /= tp_pg.size()
-
-
 def save_2d_optim():
     torch.manual_seed(107)
     model_tp, tp_pg, dp_pg = init_model()
