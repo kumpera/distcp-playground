@@ -8,6 +8,7 @@ from torch.distributed._shard.checkpoint.metadata import (
 )
 from torch.distributed._shard.sharded_tensor.api import ShardedTensor
 from spmd import  DTensor as DT
+import logging
 
 def keep_visiting_tensors(value):
     return isinstance(value, torch.Tensor)
@@ -54,25 +55,34 @@ def traverse_state_dict(state_dict: STATE_DICT_TYPE, visitor, keep_traversing=ke
     for key, value in state_dict.items():
         _traverse_obj((str(key),), value)
 
-def print_visitor(path, value, prefix=""):
-    print(f"{prefix}[{path}] :: {type(value)}")
+def print_visitor(path, value, prefix="", print_fun=print):
+    print_fun(f"{prefix}[{path}] :: {type(value)}")
 
-
-def print_tensor(value, padding="", prefix=""):
+def print_tensor(value, padding="", prefix="", print_fun=print):
     if isinstance(value, ShardedTensor):
-        print(f"{padding}{prefix}ShardedTensor size {value.size()}")
+        print_fun(f"{padding}{prefix}ShardedTensor size {value.size()}")
         for shard in value.local_shards():
-            print_tensor(shard.tensor, f"{padding}\t", f"{shard.metadata.shard_offsets} ")
+            print_tensor(shard.tensor, f"{padding}\t", f"{shard.metadata.shard_offsets} ", print_fun=print_fun)
     elif isinstance(value, DT):
-        print(f"{padding}{prefix}DistributedTensor size {value.size()}")
+        print_fun(f"{padding}{prefix}DistributedTensor size {value.size()}")
         # for shard in value.local_shards():
-        print_tensor(value.local_tensor, f"{padding}\t", f"(offset ???) ")
+        print_tensor(value.local_tensor, f"{padding}\t", f"(offset ???) ", print_fun=print_fun)
     else:
-        print(f"{padding}{prefix}Tensor size {value.size()}")
+        print_fun(f"{padding}{prefix}Tensor size {value.size()}")
 
 
-def print_sharded_tensor(path, value):
+def print_sharded_tensor(path, value, print_fun=print):
     if not isinstance(value, ShardedTensor) and not isinstance(value, DT):
-        print_visitor(path, value)
+        print_visitor(path, value, print_fun=print_fun)
     else:
-        print_tensor(value, prefix=path)
+        print_tensor(value, prefix=path, print_fun=print_fun)
+
+
+logger = logging.getLogger("distcp-playground")
+LOGGER_INIT=False
+def get_logger():
+    global LOGGER_INIT
+    if not LOGGER_INIT:
+        logger.addHandler(logging.FileHandler(f"checkpoints/{torch.distributed.get_rank()}.log", "w+"))
+        LOGGER_INIT = True
+    return logger

@@ -19,7 +19,7 @@ from torch.distributed._shard.checkpoint.metadata import (
     MetadataIndex
 )
 
-from .utils import traverse_state_dict
+from .utils import (traverse_state_dict, get_logger)
 
 
 def set_element(root_dict, path, value):

@@ -1,6 +1,7 @@
 import copy
 import dataclasses
-from functools import reduce
+from functools import reduce, partial
+from pickle import FALSE
 from typing import Dict,Any, List, Sequence, Tuple
 from torch.distributed._shard.checkpoint.planner import LoadPlan, SavePlan
 from torch.distributed._shard.sharded_tensor import shard
@@ -24,10 +25,13 @@ from torch.distributed._shard.checkpoint.default_planner import (
 )
 from torch.distributed._shard.api import _shard_tensor
 
-
-
 import distcp_playground.nested as cp_nested
 
+from distcp_playground.utils import (
+    traverse_state_dict,
+    print_sharded_tensor,
+    get_logger
+)
 
 import torch
 
@@ -41,8 +45,10 @@ def flatten_sharded_tensors(state_dict: Dict[str, Any]) -> Dict[str, Any]:
             new_state_dict[key] = value
             continue
         shards = value.local_shards()
+        if len(shards) == 0:
+            continue
         if len(shards) != 1:
-            raise ValueError("Cannot handle outer tensor with more than 1 shard")
+            raise ValueError(f"Cannot handle outer tensor with more than 1 shard {key} -- {len(shards)}")
         outer_shard = shards[0]
 
         inner_st = outer_shard.tensor
@@ -258,56 +264,99 @@ def load_2d_optimizer_state_dict(model_state_dict, optimizer_prefixes, storage_r
 
     return state_dict
 
-class NestedTensorSaver(DefaultSavePlanner):
-    def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
-        return super().init(flatten_sharded_tensors(state_dict), is_coordinator)
+# class NestedTensorSaver(DefaultSavePlanner):
+#     def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
+#         return super().init(flatten_sharded_tensors(state_dict), is_coordinator)
 
 class NestedTensorLoader(DefaultLoadPlanner):
     def init(self, state_dict: STATE_DICT_TYPE, metadata: Metadata, is_coordinator: bool) -> None:
         return super().init(flatten_sharded_tensors(state_dict), metadata, is_coordinator)
 
-class NestedRenamingTensorSaver(DefaultSavePlanner):
+# class NestedRenamingTensorSaver(DefaultSavePlanner):
+#     def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
+#         state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
+#         state_dict = flatten_sharded_tensors(state_dict)
+#         return super().init(state_dict, is_coordinator)
+
+#     def create_local_plan(self) -> SavePlan:
+#         plan = super().create_local_plan()
+#         return dataclasses.replace(plan, planner_data=self.mappings)
+
+#     def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+#         global_plan, metadata = super().create_global_plan(all_plans)
+#         merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
+#         metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
+#         return global_plan, metadata
+
+
+def print_to_log(log_line):
+    get_logger().info(f"{dist.get_rank()} :: {log_line}")
+
+# class NestedDedupTensorSaver(DefaultSavePlanner):
+#     def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
+#         # traverse_state_dict(state_dict, partial(print_sharded_tensor, print_fun=print_to_log))
+#         return super().init(flatten_sharded_tensors(state_dict), is_coordinator)
+
+#     def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+#         all_plans = dedup_tensors(all_plans)
+#         return super().create_global_plan(all_plans)
+
+# # This is ridiculous, lets just have UberSaver that a bucket of bools
+# class NestedDedupRenamingTensorSaver(DefaultSavePlanner):
+#     def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
+#         state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
+#         state_dict = flatten_sharded_tensors(state_dict)
+#         return super().init(state_dict, is_coordinator)
+
+#     def create_local_plan(self) -> SavePlan:
+#         plan = super().create_local_plan()
+#         return dataclasses.replace(plan, planner_data=self.mappings)
+
+#     def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+#         all_plans = dedup_tensors(all_plans)
+#         global_plan, metadata = super().create_global_plan(all_plans)
+#         merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
+#         self.metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
+#         get_logger().info(f">>>> mapping {merged_mappings}")
+#         return global_plan, self.metadata
+
+class UberSavePlanner(DefaultSavePlanner):
+    def __init__(
+        self,
+        flatten_state_dict=True,
+        flatten_sharded_tensors=True,
+        dedup_replicated_tensors=True
+    ):
+        self.flatten_state_dict = flatten_state_dict
+        self.flatten_sharded_tensors = flatten_sharded_tensors
+        self.dedup_replicated_tensors = dedup_replicated_tensors
+
     def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
-        state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
-        state_dict = flatten_sharded_tensors(state_dict)
+        if self.flatten_state_dict:
+            state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
+        if self.flatten_sharded_tensors:
+            state_dict = flatten_sharded_tensors(state_dict)
+
         return super().init(state_dict, is_coordinator)
 
     def create_local_plan(self) -> SavePlan:
         plan = super().create_local_plan()
-        return dataclasses.replace(plan, planner_data=self.mappings)
+        if self.flatten_state_dict:
+            plan = dataclasses.replace(plan, planner_data=self.mappings)
+        return plan
 
     def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+        if self.dedup_replicated_tensors:
+            all_plans = dedup_tensors(all_plans)
+
         global_plan, metadata = super().create_global_plan(all_plans)
-        merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
-        metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
+
+        if self.flatten_state_dict:
+            merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
+            metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
+
         return global_plan, metadata
 
-
-class NestedDedupTensorSaver(DefaultSavePlanner):
-    def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
-        return super().init(flatten_sharded_tensors(state_dict), is_coordinator)
-
-    def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
-        all_plans = dedup_tensors(all_plans)
-        return super().create_global_plan(all_plans)
-
-# This is ridiculous, lets just have UberSaver that a bucket of bools
-class NestedDedupRenamingTensorSaver(DefaultSavePlanner):
-    def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
-        state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
-        state_dict = flatten_sharded_tensors(state_dict)
-        return super().init(state_dict, is_coordinator)
-
-    def create_local_plan(self) -> SavePlan:
-        plan = super().create_local_plan()
-        return dataclasses.replace(plan, planner_data=self.mappings)
-
-    def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
-        all_plans = dedup_tensors(all_plans)
-        global_plan, metadata = super().create_global_plan(all_plans)
-        merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
-        metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
-        return global_plan, metadata
 
 def element_wise_sub(a, b):
     return [i_a - i_b for i_a, i_b in zip(a,b)]
