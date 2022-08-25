@@ -9,6 +9,7 @@ from torch.distributed._shard.checkpoint.metadata import (
 from torch.distributed._shard.sharded_tensor.api import ShardedTensor
 from spmd import  DTensor as DT
 import logging
+import os.path
 
 def keep_visiting_tensors(value):
     return isinstance(value, torch.Tensor)
@@ -77,12 +78,14 @@ def print_sharded_tensor(path, value, print_fun=print):
     else:
         print_tensor(value, prefix=path, print_fun=print_fun)
 
-
 logger = logging.getLogger("distcp-playground")
 LOGGER_INIT=False
 def get_logger():
     global LOGGER_INIT
     if not LOGGER_INIT:
-        logger.addHandler(logging.FileHandler(f"checkpoints/{torch.distributed.get_rank()}.log", "w+"))
+        if os.path.isdir("checkpoints"):
+            logger.addHandler(logging.FileHandler(f"checkpoints/{torch.distributed.get_rank()}.log", "w+"))
+        if os.path.isdir("logs"):
+            logger.addHandler(logging.FileHandler(f"logs/{torch.distributed.get_rank()}.log", "w+"))
         LOGGER_INIT = True
     return logger

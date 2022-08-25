@@ -41,23 +41,23 @@ def element_wise_add(a: List[int], b: List[int]) -> List[int]:
     return [i_a + i_b for i_a, i_b in zip(a,b)]
 
 def flatten_sharded_tensors(state_dict: Dict[str, Any]) -> Dict[str, Any]:
-    new_state_dict = type(state_dict)()
-    for key, value in state_dict.items():
+    new_state_dict = {}
+
+    def rewrite_dict(path, value):
         if not isinstance(value, ShardedTensor):
-            new_state_dict[key] = value
-            continue
+            cp_nested.set_element(new_state_dict, path, value)
+            return
         shards = value.local_shards()
         if len(shards) == 0:
-            continue
+            return
         if len(shards) != 1:
             raise ValueError(f"Cannot handle outer tensor with more than 1 shard {key} -- {len(shards)}")
         outer_shard = shards[0]
 
-
         inner_st = outer_shard.tensor
         if not isinstance(inner_st, ShardedTensor):
-            new_state_dict[key] = value
-            continue
+            cp_nested.set_element(new_state_dict, path, value)
+            return
 
         if len(inner_st.local_shards()) != 1:
             raise ValueError("Cannot handle inner tensor with more than 1 shard")
@@ -74,7 +74,6 @@ def flatten_sharded_tensors(state_dict: Dict[str, Any]) -> Dict[str, Any]:
                     placement=f"rank:{dist.get_rank()}/{inner_shard.tensor.device}"
                 ))
         ]
-        get_logger().info(f"{key} flattening {outer_shard.metadata} > {inner_shard.metadata} => {local_shards[0].metadata}")
 
         st_meta: ShardedTensorMetadata = copy.deepcopy(value.metadata())
         other_rank = 0 if dist.get_rank() > 0 else 1
@@ -106,8 +105,9 @@ def flatten_sharded_tensors(state_dict: Dict[str, Any]) -> Dict[str, Any]:
             local_shards=local_shards,
             sharded_tensor_metadata=st_meta,
         )
-        new_state_dict[key] = st
+        cp_nested.set_element(new_state_dict, path, st)
 
+    traverse_state_dict(state_dict, rewrite_dict)
     return new_state_dict
 
 def dedup_tensors(all_plans: List[SavePlan]) -> List[SavePlan]:
@@ -136,13 +136,15 @@ def dedup_tensors(all_plans: List[SavePlan]) -> List[SavePlan]:
     return all_plans
 
 def is_nested_tensor(val: Any) -> bool:
-    if isinstance(val, ShardedTensor) and isinstance(val.local_shards()[0].tensor, ShardedTensor):
-        return True
-
+    if isinstance(val, ShardedTensor):
+        if len(val.local_shards()) == 0:
+            return False
+        if isinstance(val.local_shards()[0].tensor, ShardedTensor):
+            return True
+        if isinstance(val.local_shards()[0].tensor, DT):
+            raise ValueError("Cannot handle DT nested insided ST")
     # Safety valve for when this eventually happen
-    if isinstance(val, ShardedTensor) and isinstance(val.local_shards()[0].tensor, DT):
-        raise ValueError("Cannot handle DT nested insided ST")
-    if isinstance(val, DT) and isinstance(val._local_tensor, (DT, ShardedTensor)):
+    elif isinstance(val, DT) and isinstance(val._local_tensor, (DT, ShardedTensor)):
         raise ValueError("Cannot handle nested DT")
     return False
 
@@ -222,18 +224,15 @@ def get_data_parallel_process_group(model: torch.nn.Module):
     for module in mods.values():
         other_pg = module.process_group
         if other_pg is not None:
-            get_logger().info(f"FSDP INSTANCE: {other_pg.size()} {default_pg == other_pg} {pg_to_str(other_pg)}")
-
             if the_pg is not None and module.process_group != the_pg:
-                last_str = f"found {pg_to_str(the_pg)} and {pg_to_str(other_pg)}"
-                get_logger().info(last_str)
+                last_str = f"Mismatch DP groups among FSDP instances. Found {pg_to_str(the_pg)} and {pg_to_str(other_pg)}"
+                get_logger().warning(last_str)
                 broken = True
             else:
                 the_pg = module.process_group
 
     if broken:
-        raise ValueError(f"Mismatch DP groups {last_str}")
-    get_logger().info(f"found data parallel group: size: {the_pg.size()} {default_pg == the_pg}")
+        raise ValueError(last_str)
     return the_pg
 
 # TODO enable device control (right now we use CUDA whenever possible)
@@ -279,15 +278,24 @@ def load_2d_optimizer_state_dict(model_state_dict, optimizer_key, storage_reader
         if value.size.numel() == 1:
             state_dict[key] = alloc_tensor(value.properties, value.size)
         else:
-            # FIXME this is a hack to extract the model FQN from the
-            #  optimizer state key. IE for state.foo.bar.exp_avg we want foo.bar
-            # spec_key = key[6:key.rindex('.')]
             spec_key = key_path[2]
             alloc_size = layout_specs.get(spec_key, (None, value.size))[1]
-            st = _shard_tensor(
-                alloc_tensor(value.properties, alloc_size),
-                sharding_spec=tp_spec, 
-                process_group=dp_pg
+
+            st_md = tp_spec.build_metadata(alloc_size, value.properties)
+            local_shards = []
+            current_rank = dist.get_rank(dp_pg)
+            for shard_md in st_md.shards_metadata:
+                if shard_md.placement.rank() != current_rank:
+                    continue
+                local_shards.append(
+                    Shard(
+                        tensor=alloc_tensor(value.properties, shard_md.shard_sizes),
+                        metadata=shard_md,
+                    )
+                )
+
+            st = ShardedTensor._init_from_local_shards_and_global_metadata(
+                local_shards, st_md, process_group=dp_pg
             )
 
             if spec_key in layout_specs and layout_specs[spec_key][0] is not None:
@@ -337,13 +345,6 @@ def check_box_bounds(outer_box_size, inner_box):
     return True
 
 def validate_global_plan(global_plan: List[SavePlan], metadata: Metadata) -> bool:
-    # get_logger().info("dumping writes:")
-    # for plan_idx, plan in enumerate(global_plan):
-    #     for item_idx, item in enumerate(plan.items):
-    #         get_logger().info(f"[{plan_idx}] ({item_idx}) {item}")
-
-    # get_logger().info(f"metadata:{metadata}")
-
     all_good = True
     for key, value in metadata.state_dict_metadata.items():
         if isinstance(value, BytesStorageMetadata):
@@ -354,18 +355,18 @@ def validate_global_plan(global_plan: List[SavePlan], metadata: Metadata) -> boo
         chunks_volume = 0
         for chunk_idx, chunk0 in enumerate(value.chunks):
             if not check_box_bounds(value.size, chunk0):
-                get_logger().warn(f"key:{key} has out of bounds chunk: tensor-size:{value.size} chunk: {chunk0}")
+                get_logger().warning(f"key:{key} has out of bounds chunk: tensor-size:{value.size} chunk: {chunk0}")
                 all_good = False
             chunks_volume += math.prod(chunk0.sizes)
 
             for chunk1 in value.chunks[chunk_idx + 1:]:
                 if check_box_overlap(chunk0, chunk1):
-                    get_logger().warn(f"key:{key} has overlapping chunks: {chunk0} {chunk1}")
+                    get_logger().warning(f"key:{key} has overlapping chunks: {chunk0} {chunk1}")
                     all_good = False
 
         tensor_volume = math.prod(value.size)
         if chunks_volume != tensor_volume:
-            get_logger().warn(f"key:{key} invalid fill tensor-volume: {tensor_volume} chunks-volume: {chunks_volume}")
+            get_logger().warning(f"key:{key} invalid fill tensor-volume: {tensor_volume} chunks-volume: {chunks_volume}")
             all_good = False
 
     return all_good
@@ -400,7 +401,6 @@ def print_to_log(log_line):
 
 class NestedDedupTensorSaver(DefaultSavePlanner):
     def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
-        # traverse_state_dict(state_dict, partial(print_sharded_tensor, print_fun=print_to_log))
         return super().init(flatten_sharded_tensors(state_dict), is_coordinator)
 
     def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
@@ -423,7 +423,6 @@ class NestedDedupRenamingTensorSaver(DefaultSavePlanner):
         global_plan, metadata = super().create_global_plan(all_plans)
         merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
         self.metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
-        get_logger().info(f">>>> mapping {merged_mappings}")
         return global_plan, self.metadata
 
 class UberSavePlanner(DefaultSavePlanner):
@@ -442,7 +441,6 @@ class UberSavePlanner(DefaultSavePlanner):
             state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
         if self.flatten_sharded_tensors:
             state_dict = flatten_sharded_tensors(state_dict)
-
         return super().init(state_dict, is_coordinator)
 
     def create_local_plan(self) -> SavePlan:
@@ -464,8 +462,19 @@ class UberSavePlanner(DefaultSavePlanner):
         if not validate_global_plan(global_plan, metadata):
             raise ValueError("Failed to validate global plan")
 
-
         return global_plan, metadata
+
+# This is actually not needed if all transforms are writen in terms of traverse_state_dict
+class StateDictEditor:
+    def __init__(self, state_dict):
+        self.original = state_dict
+
+    def apply_mappin(self, mapping):
+        pass
+
+    def change_value(self, str_of_path, value):
+        pass
+
 
 class UberLoadPlanner(DefaultLoadPlanner):
     def __init__(
@@ -477,30 +486,25 @@ class UberLoadPlanner(DefaultLoadPlanner):
         self.flatten_sharded_tensors = flatten_sharded_tensors
 
     def init(self, state_dict: STATE_DICT_TYPE, metadata: Metadata, is_coordinator: bool) -> None:
-        self.original_state_dict = state_dict
-        # traverse_state_dict(state_dict, partial(print_sharded_tensor, print_fun=print_to_log))
-        # get_logger().info(f"{dist.get_rank()} :: ----------")
-
-        if self.flatten_state_dict:
-            state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
-            self.checkpoint_mappings = metadata.planner_data
-
         if self.flatten_sharded_tensors:
             state_dict = flatten_sharded_tensors(state_dict)
-        # traverse_state_dict(state_dict, partial(print_sharded_tensor, print_fun=print_to_log))
-        # get_logger().info(f"MD: {metadata}")
+
+        self.original_state_dict = state_dict        
+        if self.flatten_state_dict:
+            state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
+            # Note that we don't need the checkpoint mappings as we assume
+            # that they are compatible with the one we just computed
 
         return super().init(state_dict, metadata, is_coordinator)
 
     def load_bytes(self, read_item: ReadItem, value: io.BytesIO) -> None:
         cp_nested.set_element(
             self.original_state_dict,
-            self.checkpoint_mappings[read_item.dest_index.fqn],
+            self.mappings[read_item.dest_index.fqn],
             torch.load(value)
         )
 
     def lookup_tensor(self, index: MetadataIndex) -> torch.Tensor:
-        # FIXME aren't checkpoint_mappings and mappings supposedly compatible? I don't remember why I need this
         obj = cp_nested.get_element(self.original_state_dict, self.mappings[index.fqn])
         return find_tensor_shard(obj, index)
 

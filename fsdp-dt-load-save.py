@@ -30,6 +30,8 @@ from distcp_playground.dist_2d import (
     NestedDedupRenamingTensorSaver,
     load_2d_optimizer_state_dict,
     get_data_parallel_process_group,
+    UberLoadPlanner,
+    UberSavePlanner
 )
 
 from distcp_playground.run import dist_run
@@ -193,10 +195,15 @@ def save_dt_model():
     with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
         checkpoint = model.state_dict()
 
+        state_dict = {
+            "model": checkpoint,
+            "other": "save-time-string"
+        }
+
         dist_cp.save_state_dict(
-            state_dict=checkpoint,
+            state_dict=state_dict,
             storage_writer=dist_cp.FileSystemWriter(CHECKPOINT_DIR),
-            planner=NestedDedupTensorSaver()
+            planner=UberSavePlanner()
         )
 
 def load_dt_model():
@@ -208,13 +215,16 @@ def load_dt_model():
 
     with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
         checkpoint = model.state_dict()
-
+        state_dict = {
+            "model": checkpoint,
+            "other": ""
+        }
         dist_cp.load_state_dict(
-            state_dict=checkpoint,
+            state_dict=state_dict,
             storage_reader=dist_cp.FileSystemReader(CHECKPOINT_DIR),
-            planner=NestedTensorLoader()
+            planner=UberLoadPlanner()
         )
-        model.load_state_dict(checkpoint)
+        model.load_state_dict(state_dict["model"])
 
     with FSDP.summon_full_params(model):
         p0(f"after-load: net1.bias {model.net1.bias}")
