@@ -2,6 +2,7 @@ import copy
 import dataclasses
 from functools import reduce, partial
 import io
+import math
 from pickle import FALSE
 from typing import Dict,Any, List, Sequence, Tuple
 from torch.distributed._shard.checkpoint.planner import LoadPlan, ReadItem, SavePlan
@@ -10,7 +11,7 @@ from torch.distributed._shard.sharded_tensor import shard
 from torch.distributed._shard.sharded_tensor.api import ShardedTensor
 import torch.distributed as dist
 import torch.distributed._shard.checkpoint as dist_cp
-from torch.distributed._shard.checkpoint.metadata import BytesStorageMetadata, Metadata, MetadataIndex, STATE_DICT_TYPE, TensorStorageMetadata
+from torch.distributed._shard.checkpoint.metadata import BytesStorageMetadata, ChunkStorageMetadata, Metadata, MetadataIndex, STATE_DICT_TYPE, TensorStorageMetadata
 from torch.distributed._shard.checkpoint.resharding import _create_sharded_read_items, create_read_items, create_write_items
 from torch.distributed._shard.checkpoint.utils import find_state_dict_object, find_tensor_shard
 from torch.distributed._shard.metadata import ShardMetadata
@@ -52,6 +53,7 @@ def flatten_sharded_tensors(state_dict: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"Cannot handle outer tensor with more than 1 shard {key} -- {len(shards)}")
         outer_shard = shards[0]
 
+
         inner_st = outer_shard.tensor
         if not isinstance(inner_st, ShardedTensor):
             new_state_dict[key] = value
@@ -72,6 +74,7 @@ def flatten_sharded_tensors(state_dict: Dict[str, Any]) -> Dict[str, Any]:
                     placement=f"rank:{dist.get_rank()}/{inner_shard.tensor.device}"
                 ))
         ]
+        get_logger().info(f"{key} flattening {outer_shard.metadata} > {inner_shard.metadata} => {local_shards[0].metadata}")
 
         st_meta: ShardedTensorMetadata = copy.deepcopy(value.metadata())
         other_rank = 0 if dist.get_rank() > 0 else 1
@@ -197,23 +200,47 @@ def alloc_tensor(props: TensorProperties, size: torch.Size):
         device=torch.cuda.current_device()
     )
 
+
+def pg_to_str(pg: dist.ProcessGroup) -> str:
+    if pg == dist.distributed_c10d._get_default_group():
+        return "global"
+
+    # looking into internals more than Jack the Ripper
+    global_ranks = list(dist.distributed_c10d._pg_group_ranks[pg].keys())
+    pg_membership = "_".join(str(x) for x in global_ranks)
+
+    return pg_membership
+
 def get_data_parallel_process_group(model: torch.nn.Module):
     from torch.distributed.fsdp._optim_utils import _get_flat_param_to_fsdp_module
 
     mods = _get_flat_param_to_fsdp_module(model)
     the_pg = None
+    default_pg = dist.distributed_c10d._get_default_group()
+    broken = False
+    last_str = None
     for module in mods.values():
-        if module.process_group is not None:
+        other_pg = module.process_group
+        if other_pg is not None:
+            get_logger().info(f"FSDP INSTANCE: {other_pg.size()} {default_pg == other_pg} {pg_to_str(other_pg)}")
+
             if the_pg is not None and module.process_group != the_pg:
-                raise ValueError("Mismatch DP groups")
-            the_pg = module.process_group
+                last_str = f"found {pg_to_str(the_pg)} and {pg_to_str(other_pg)}"
+                get_logger().info(last_str)
+                broken = True
+            else:
+                the_pg = module.process_group
+
+    if broken:
+        raise ValueError(f"Mismatch DP groups {last_str}")
+    get_logger().info(f"found data parallel group: size: {the_pg.size()} {default_pg == the_pg}")
     return the_pg
 
 # TODO enable device control (right now we use CUDA whenever possible)
 # Picking a device is not easy as we need to know the PG backend capabilities
 # And cuda is even worse cuz we have to hardcode whether we're using CUDA_VISIBLE_DEVICES or not
 # To sum up, the ST API is effing hard to work with and most of the data we pass in is useless
-def load_2d_optimizer_state_dict(model_state_dict, optimizer_prefixes, storage_reader, dp_pg):
+def load_2d_optimizer_state_dict(model_state_dict, optimizer_key, storage_reader, dp_pg):
     #FIXME this needs to be made general
     metadata = storage_reader.read_metadata()
 
@@ -241,7 +268,8 @@ def load_2d_optimizer_state_dict(model_state_dict, optimizer_prefixes, storage_r
     """
     fqn_to_offset = {}
     for key, value in metadata.state_dict_metadata.items():
-        if not any(key.startswith(p) for p in optimizer_prefixes):
+        key_path = metadata.planner_data[key]
+        if key_path[0] != optimizer_key:
             continue
 
         if isinstance(value, BytesStorageMetadata):
@@ -253,7 +281,8 @@ def load_2d_optimizer_state_dict(model_state_dict, optimizer_prefixes, storage_r
         else:
             # FIXME this is a hack to extract the model FQN from the
             #  optimizer state key. IE for state.foo.bar.exp_avg we want foo.bar
-            spec_key = key[6:key.rindex('.')]
+            # spec_key = key[6:key.rindex('.')]
+            spec_key = key_path[2]
             alloc_size = layout_specs.get(spec_key, (None, value.size))[1]
             st = _shard_tensor(
                 alloc_tensor(value.properties, alloc_size),
@@ -276,6 +305,70 @@ def load_2d_optimizer_state_dict(model_state_dict, optimizer_prefixes, storage_r
     state_dict = cp_nested.unflatten_state_dict(state_dict, metadata.planner_data)
 
     return state_dict
+
+
+def check_box_overlap(box0, box1):
+    """
+    Checks if two boxes overlap. Tuples are (offset, lengths)
+    """
+
+    # For each dim of each shard, check if one shard resides on the other
+    # end of second shard with respect to that dim. As an example for a 2D
+    # shard, we would check if one shard is above or on the left of the
+    # other shard.
+    ndims = len(box0.offsets)
+    for i in range(ndims):
+        if box0.offsets[i] >= box1.offsets[i] + box1.sizes[i]:
+            return False
+        if box1.offsets[i] >= box0.offsets[i] + box0.sizes[i]:
+            return False
+
+    return True
+
+def check_box_bounds(outer_box_size, inner_box):
+    for i in range(len(outer_box_size)):
+        if inner_box.offsets[i] < 0:
+            return False
+        if inner_box.sizes[i] < 0:
+            return False
+        if inner_box.offsets[i] + inner_box.sizes[i] > outer_box_size[i]:
+            return False
+
+    return True
+
+def validate_global_plan(global_plan: List[SavePlan], metadata: Metadata) -> bool:
+    # get_logger().info("dumping writes:")
+    # for plan_idx, plan in enumerate(global_plan):
+    #     for item_idx, item in enumerate(plan.items):
+    #         get_logger().info(f"[{plan_idx}] ({item_idx}) {item}")
+
+    # get_logger().info(f"metadata:{metadata}")
+
+    all_good = True
+    for key, value in metadata.state_dict_metadata.items():
+        if isinstance(value, BytesStorageMetadata):
+            continue
+        if len(value.size) == 0:
+            continue
+        #check for overlap
+        chunks_volume = 0
+        for chunk_idx, chunk0 in enumerate(value.chunks):
+            if not check_box_bounds(value.size, chunk0):
+                get_logger().warn(f"key:{key} has out of bounds chunk: tensor-size:{value.size} chunk: {chunk0}")
+                all_good = False
+            chunks_volume += math.prod(chunk0.sizes)
+
+            for chunk1 in value.chunks[chunk_idx + 1:]:
+                if check_box_overlap(chunk0, chunk1):
+                    get_logger().warn(f"key:{key} has overlapping chunks: {chunk0} {chunk1}")
+                    all_good = False
+
+        tensor_volume = math.prod(value.size)
+        if chunks_volume != tensor_volume:
+            get_logger().warn(f"key:{key} invalid fill tensor-volume: {tensor_volume} chunks-volume: {chunks_volume}")
+            all_good = False
+
+    return all_good
 
 class NestedTensorSaver(DefaultSavePlanner):
     def init(self, state_dict: Dict[str, Any], is_coordinator: bool) -> None:
@@ -368,6 +461,10 @@ class UberSavePlanner(DefaultSavePlanner):
             merged_mappings = reduce(lambda x, y: x | y, (p.planner_data for p in global_plan))
             metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
 
+        if not validate_global_plan(global_plan, metadata):
+            raise ValueError("Failed to validate global plan")
+
+
         return global_plan, metadata
 
 class UberLoadPlanner(DefaultLoadPlanner):
@@ -381,6 +478,8 @@ class UberLoadPlanner(DefaultLoadPlanner):
 
     def init(self, state_dict: STATE_DICT_TYPE, metadata: Metadata, is_coordinator: bool) -> None:
         self.original_state_dict = state_dict
+        # traverse_state_dict(state_dict, partial(print_sharded_tensor, print_fun=print_to_log))
+        # get_logger().info(f"{dist.get_rank()} :: ----------")
 
         if self.flatten_state_dict:
             state_dict, self.mappings = cp_nested.flatten_state_dict(state_dict)
@@ -388,6 +487,9 @@ class UberLoadPlanner(DefaultLoadPlanner):
 
         if self.flatten_sharded_tensors:
             state_dict = flatten_sharded_tensors(state_dict)
+        # traverse_state_dict(state_dict, partial(print_sharded_tensor, print_fun=print_to_log))
+        # get_logger().info(f"MD: {metadata}")
+
         return super().init(state_dict, metadata, is_coordinator)
 
     def load_bytes(self, read_item: ReadItem, value: io.BytesIO) -> None:

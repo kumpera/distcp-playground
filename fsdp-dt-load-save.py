@@ -239,8 +239,12 @@ def save_dt_optim():
             print(f"[[{dist.get_rank()}]] before-save optim-state: net1:{net1_bias} net2:{net2_bias}")
         dist.barrier()
 
+    state_dict = {
+        "optimizer_state": optim_state
+    }
+
     md = dist_cp.save_state_dict(
-        state_dict=optim_state,
+        state_dict=state_dict,
         storage_writer=dist_cp.FileSystemWriter(CHECKPOINT_DIR),
         planner=NestedDedupRenamingTensorSaver()
     )
@@ -249,7 +253,7 @@ def dump_checkpoint():
     dist.barrier()
     if dist.get_rank() == 0:
         metadata = dist_cp.FileSystemReader(CHECKPOINT_DIR).read_metadata()
-        load_keys = [ "state.net1.bias.exp_avg", "state.net2.bias.exp_avg" ]
+        load_keys = [ "optimizer_state.state.net1.bias.exp_avg", "optimizer_state.state.net2.bias.exp_avg" ]
 
         state_dict = {}
         for key in load_keys:
@@ -281,13 +285,13 @@ def load_dt_optim():
         model_state_dict = model_tp.state_dict()
         optim_state = load_2d_optimizer_state_dict(
             model_state_dict,
-            optimizer_prefixes={"state", "param_groups"},
+            optimizer_key="optimizer_state",
             storage_reader=dist_cp.FileSystemReader(CHECKPOINT_DIR), 
             dp_pg=DP_PG
         )
 
-        net1_bias = optim_state["state"]["net1.bias"]["exp_avg"]
-        net2_bias = optim_state["state"]["net2.bias"]["exp_avg"]
+        net1_bias = optim_state["optimizer_state"]["state"]["net1.bias"]["exp_avg"]
+        net2_bias = optim_state["optimizer_state"]["state"]["net2.bias"]["exp_avg"]
         net1_bias = net1_bias.local_tensor()
         net2_bias = net2_bias.local_tensor()
         for i in range(dist.get_world_size()):
@@ -296,7 +300,7 @@ def load_dt_optim():
             dist.barrier()
 
         flattened_osd = FSDP.flatten_sharded_optim_state_dict(
-            optim_state, model_tp, optim_input, DP_PG
+            optim_state["optimizer_state"], model_tp, optim_input, DP_PG
         )
 
         optim.load_state_dict(flattened_osd)
