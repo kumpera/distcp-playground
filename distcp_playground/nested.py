@@ -18,6 +18,17 @@ from torch.distributed._shard.checkpoint.metadata import (
     Metadata,
     MetadataIndex
 )
+"""
+TODO
+handle:
+    tuple
+    OrderedDict
+    NamedTuple
+
+change mappings from dict to a class
+change set_element to recreate the right type (important with tuple, OD and ND)
+
+"""
 
 from .utils import (traverse_state_dict, get_logger)
 

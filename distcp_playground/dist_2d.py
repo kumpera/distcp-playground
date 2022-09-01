@@ -12,7 +12,7 @@ from torch.distributed._shard.sharded_tensor.api import ShardedTensor
 import torch.distributed as dist
 import torch.distributed._shard.checkpoint as dist_cp
 from torch.distributed._shard.checkpoint.metadata import BytesStorageMetadata, ChunkStorageMetadata, Metadata, MetadataIndex, STATE_DICT_TYPE, TensorStorageMetadata
-from torch.distributed._shard.checkpoint.resharding import _create_sharded_read_items, create_read_items, create_write_items
+from torch.distributed._shard.checkpoint.planner_helpers import _create_sharded_read_items, _create_read_items
 from torch.distributed._shard.checkpoint.utils import find_state_dict_object, find_tensor_shard
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor.metadata import ShardedTensorMetadata, TensorProperties
@@ -51,7 +51,7 @@ def flatten_sharded_tensors(state_dict: Dict[str, Any]) -> Dict[str, Any]:
         if len(shards) == 0:
             return
         if len(shards) != 1:
-            raise ValueError(f"Cannot handle outer tensor with more than 1 shard {key} -- {len(shards)}")
+            raise ValueError(f"Cannot handle outer tensor with more than 1 shard {path} -- {len(shards)}")
         outer_shard = shards[0]
 
         inner_st = outer_shard.tensor
@@ -240,7 +240,6 @@ def get_data_parallel_process_group(model: torch.nn.Module):
 # And cuda is even worse cuz we have to hardcode whether we're using CUDA_VISIBLE_DEVICES or not
 # To sum up, the ST API is effing hard to work with and most of the data we pass in is useless
 def load_2d_optimizer_state_dict(model_state_dict, optimizer_key, storage_reader, dp_pg):
-    #FIXME this needs to be made general
     metadata = storage_reader.read_metadata()
 
     layout_specs = get_state_dict_2d_layout(model_state_dict)
@@ -524,11 +523,11 @@ class ReaderWithOffset(DefaultLoadPlanner):
         for fqn, obj in self.state_dict.items():
             md = self.metadata.state_dict_metadata[fqn]
             if not isinstance(obj, ShardedTensor):
-                requests += create_read_items(fqn, md, obj)
+                requests += _create_read_items(fqn, md, obj)
                 continue
 
             if fqn not in self.fqn_to_offset:
-                requests += create_read_items(fqn, md, obj)
+                requests += _create_read_items(fqn, md, obj)
                 continue
             
             offset = self.fqn_to_offset[fqn]

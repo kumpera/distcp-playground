@@ -10,16 +10,17 @@ import torch
 from torch.testing._internal.common_distributed import tp_transports
 
 
-def init_pg(rank, world_size):
+def init_pg(rank, world_size, backend):
     torch.distributed.init_process_group(
-        backend="nccl",
+        backend=backend,
         world_size=world_size,
         rank=rank,
         init_method = "env://"
     )
 
     # set device for nccl pg for collectives
-    torch.cuda.set_device(rank)
+    if backend == "nccl":
+        torch.cuda.set_device(rank)
 
 
 def init_rpc(rank, world_size):
@@ -40,7 +41,7 @@ def init_rpc(rank, world_size):
 
 def init_comms(options, rank, world_size):
     if options["c10d"]:
-        init_pg(rank, world_size=world_size)
+        init_pg(rank, world_size=world_size, backend=options["c10d_backend"])
     if options["rpc"]:
         init_rpc(rank, world_size)
 
@@ -63,20 +64,18 @@ def worker(rank, run_fn, options, world_size):
     destroy_comms(options)
 
 # TODO support Gloo
-def dist_run(run_fn, world_size=0, init_rpc=False, init_c10d=True):
+def dist_run(run_fn, world_size=0, init_rpc=False, init_c10d=True, c10d_backend="nccl"):
     world_size = world_size or torch.cuda.device_count()
 
     options = {
         "rpc": init_rpc,
-        "c10d": init_c10d
+        "c10d": init_c10d,
+        "c10d_backend": c10d_backend
     }
 
     port = random.randint(10000, 20000)
     os.environ["MASTER_ADDR"] ="localhost"
     os.environ["MASTER_PORT"] = str(port)
-    # init_method = f"tcp://localhost:{port}"
-    # options["init_method"] = init_method
-
 
     mp.spawn(
         fn=worker,
