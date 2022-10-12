@@ -16,6 +16,7 @@ from spmd import distribute_tensor, DeviceMesh, DTensor as DT, Shard, Replicate
 
 import torch.distributed._shard.checkpoint as dist_cp
 import torch.distributed.distributed_c10d as distributed_c10d
+import torch.nn.functional as F
 
 from distcp_playground.utils import (
     traverse_state_dict,
@@ -24,9 +25,6 @@ from distcp_playground.utils import (
 )
 
 from distcp_playground.dist_2d import (
-    NestedTensorLoader,
-    NestedDedupTensorSaver,
-    NestedRenamingTensorSaver,
     NestedDedupRenamingTensorSaver,
     load_2d_optimizer_state_dict,
     get_data_parallel_process_group,
@@ -34,6 +32,7 @@ from distcp_playground.dist_2d import (
     UberSavePlanner
 )
 
+import spmd.tensor.parallel.fsdp
 from distcp_playground.run import dist_run
 
 # Tensor-Parallel degree
@@ -66,14 +65,10 @@ class SimpleModel(torch.nn.Module):
         self.net3 = torch.nn.Linear(4, 12)
 
     def forward(self, x):
-        x_size = x.size()
-        x = x.view(-1, self.net1.weight.size(1))
-        result = self.net2(self.relu(self.net1(x)))
-        return self.net3(result.view(*x_size[:-1], -1))
-
-
-def _get_module_optim(module):
-    return torch.optim.SGD(module.parameters(), lr=LR)
+        x = F.relu(self.net1(x))
+        x = F.relu(self.net2(x))
+        x = F.relu(self.net3(x))
+        return x
 
 def _aggregate_local_tensor(module: torch.nn.Module) -> torch.nn.Module:
     def hook_func(_module, _input, output):
@@ -100,7 +95,7 @@ def _gradient_hook(param, grad):
     param._local_tensor.grad = grad._local_tensor
 
 def shard_module(m, pg):
-    start_idx = distributed_c10d._get_global_rank(pg, 0)
+    start_idx = distributed_c10d.get_global_rank(pg, 0)
     device_mesh = DeviceMesh(
         "cuda", list(range(start_idx, start_idx + pg.size())), dim_groups=[pg]
     )
@@ -236,7 +231,10 @@ def save_dt_optim():
     optim_input = list(model_tp.parameters())
     optim = torch.optim.Adam(optim_input, lr=0.0001)
 
-    model_tp(torch.rand(5).cuda()).sum().backward()
+    # with FSDP.summon_full_params(model_tp):
+
+
+    model_tp(torch.rand(4,5).cuda()).sum().backward()
     optim.step()
 
     optim_state = FSDP.sharded_optim_state_dict(model_tp, optim, optim_input)
@@ -286,7 +284,6 @@ def load_dt_optim():
     optim_input = list(model_tp.parameters())
     optim = torch.optim.Adam(optim_input, lr=0.0001)
 
-
     the_pg = get_data_parallel_process_group(model_tp)
 
     assert the_pg == DP_PG
@@ -310,15 +307,15 @@ def load_dt_optim():
             dist.barrier()
 
         flattened_osd = FSDP.flatten_sharded_optim_state_dict(
-            optim_state["optimizer_state"], model_tp, optim_input, DP_PG
+            optim_state["optimizer_state"], model_tp, optim_input
         )
 
         optim.load_state_dict(flattened_osd)
 
 
 def work():
-    # save_dt_model()
-    # load_dt_model()
+    save_dt_model()
+    load_dt_model()
 
     save_dt_optim()
     load_dt_optim()

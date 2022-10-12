@@ -147,7 +147,7 @@ def create_2d_process_groups(tp_degree) -> Tuple[dist.ProcessGroup, dist.Process
 
 def create_colwise_spec(pg):
     placements = [
-        f"rank:{idx}/cuda:{dist.distributed_c10d._get_global_rank(pg, idx) % torch.cuda.device_count()}"
+        f"rank:{idx}/cuda:{dist.distributed_c10d.get_global_rank(pg, idx) % torch.cuda.device_count()}"
         for idx in range(pg.size())
     ]
     return ChunkShardingSpec(

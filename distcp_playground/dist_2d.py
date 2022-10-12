@@ -178,7 +178,7 @@ def gen_rank_device(global_rank):
 
 def create_colwise_spec(pg):
     placements = [
-        f"rank:{idx}/{gen_rank_device(dist.distributed_c10d._get_global_rank(pg, idx))}"
+        f"rank:{idx}/{gen_rank_device(dist.distributed_c10d.get_global_rank(pg, idx))}"
         for idx in range(pg.size())
     ]
     return ChunkShardingSpec(
